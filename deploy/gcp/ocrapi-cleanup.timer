@@ -1,0 +1,14 @@
+[Unit]
+Description=Daily ocrapi job-folder cleanup
+Documentation=man:systemd.timer(5)
+
+[Timer]
+OnCalendar=daily
+# Also run 10 minutes after boot to catch jobs left after a crash.
+OnBootSec=10min
+Persistent=true
+RandomizedDelaySec=15min
+Unit=ocrapi-cleanup.service
+
+[Install]
+WantedBy=timers.target

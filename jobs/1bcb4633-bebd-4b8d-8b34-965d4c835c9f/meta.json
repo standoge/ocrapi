@@ -1,0 +1,15 @@
+{
+  "jobId": "1bcb4633-bebd-4b8d-8b34-965d4c835c9f",
+  "status": "failed",
+  "originalFilename": "ejemplo.pdf",
+  "outputFilename": null,
+  "folderId": null,
+  "pageCount": null,
+  "error": "PDF has 1357 pages; maximum allowed is 30",
+  "driveFileId": null,
+  "driveWebViewLink": null,
+  "driveUploadError": null,
+  "createdAt": "2026-06-01T17:49:03.742454+00:00",
+  "startedAt": "2026-06-01T17:49:04.291069+00:00",
+  "finishedAt": "2026-06-01T17:49:04.673896+00:00"
+}

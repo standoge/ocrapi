@@ -1,0 +1,15 @@
+{
+  "jobId": "61bf8c32-21a6-429e-a164-f076d9ee9681",
+  "status": "failed",
+  "originalFilename": "ejemplo.pdf",
+  "outputFilename": null,
+  "folderId": null,
+  "pageCount": null,
+  "error": "OCR pipeline failed: [Errno 28] No space left on device",
+  "driveFileId": null,
+  "driveWebViewLink": null,
+  "driveUploadError": null,
+  "createdAt": "2026-06-07T00:50:34.696144+00:00",
+  "startedAt": "2026-06-07T00:50:38.151227+00:00",
+  "finishedAt": "2026-06-07T00:55:53.934162+00:00"
+}

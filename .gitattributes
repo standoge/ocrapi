@@ -1,0 +1,5 @@
+# Shell scripts and Linux deploy artifacts must use LF (bash/systemd break on CRLF).
+*.sh text eol=lf
+deploy/gcp/*.service text eol=lf
+deploy/gcp/*.timer text eol=lf
+deploy/gcp/*.env.example text eol=lf

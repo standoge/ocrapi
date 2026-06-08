@@ -1,0 +1,14 @@
+[Unit]
+Description=Prune old ocrapi job folders and stale ocrmypdf scratch
+Wants=data.mount
+After=data.mount
+
+[Service]
+Type=oneshot
+# Defaults are baked into the script; override here if you want different
+# retention without editing the script.
+Environment=RETENTION_DAYS=7
+Environment=TMP_STALE_HOURS=12
+ExecStart=/usr/local/bin/ocrapi-cleanup.sh
+Nice=10
+IOSchedulingClass=idle

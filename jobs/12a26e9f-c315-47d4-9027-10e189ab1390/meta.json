@@ -1,0 +1,15 @@
+{
+  "jobId": "12a26e9f-c315-47d4-9027-10e189ab1390",
+  "status": "failed",
+  "originalFilename": "sample.pdf",
+  "outputFilename": null,
+  "folderId": null,
+  "pageCount": null,
+  "error": "Invalid or corrupted PDF: Trailer cannot be read: Unexpected type '/Page'",
+  "driveFileId": null,
+  "driveWebViewLink": null,
+  "driveUploadError": null,
+  "createdAt": "2026-06-01T17:40:30.691818+00:00",
+  "startedAt": "2026-06-01T17:42:55.564550+00:00",
+  "finishedAt": "2026-06-01T17:42:55.609523+00:00"
+}

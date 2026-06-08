@@ -1,0 +1,15 @@
+{
+  "jobId": "bb565e77-2933-4826-b3de-0492dd19a956",
+  "status": "succeeded",
+  "originalFilename": "ejemplo.pdf",
+  "outputFilename": null,
+  "folderId": null,
+  "pageCount": 1357,
+  "error": null,
+  "driveFileId": null,
+  "driveWebViewLink": null,
+  "driveUploadError": null,
+  "createdAt": "2026-06-01T18:16:11.283394+00:00",
+  "startedAt": "2026-06-01T18:16:11.843706+00:00",
+  "finishedAt": "2026-06-01T19:26:22.047771+00:00"
+}
