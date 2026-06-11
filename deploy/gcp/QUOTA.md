@@ -1,23 +1,20 @@
 # Document AI quota: read before raising concurrency
 
-The single hardest ceiling on this stack's throughput is **Document AI online
-processing quota**, not VM CPU. The OCR work itself runs on Google's side; the
-VM just rasterizes pages locally and forwards them to the
-`documentai.processors.processOnline` endpoint.
+The throughput ceiling for **async jobs** is **Document AI batch processing
+quota**, not VM CPU. Large PDFs are submitted as a single batch operation;
+Document AI rasterizes and OCRs server-side while the VM polls the long-running
+operation and assembles the searchable PDF with PyMuPDF.
 
-With the defaults out of the box, you will hit `RESOURCE_EXHAUSTED` (HTTP 429
-/ gRPC code 8) long before saturating a `c4-standard-16`. The retry policy in
-[`ocr_documentai_plugin/documentai_client.py`](../../ocr_documentai_plugin/documentai_client.py)
-will paper over short bursts, but a sustained overload turns into job
-failures.
+The **sync** endpoint (`POST /v1/ocr`) still uses the online
+`processDocument` API on whole PDFs (small docs only, up to `SYNC_MAX_PAGES`).
 
 ## Default vs. effective limits
 
 | Metric                                                       | Default (approx.)               | Where it bites                                                                                          |
 | ------------------------------------------------------------ | ------------------------------- | ------------------------------------------------------------------------------------------------------- |
-| `processor_request_per_minute_per_project_per_region`        | ~1,800 req/min (30 req/s)       | Each rasterized page = 1 online request. 32 parallel page workers can spike past this for a few seconds.|
-| Online processing page-rate                                  | varies, often ~120 pages/min    | The real ceiling for sustained throughput.                                                              |
-| `prediction_long_running_requests_per_minute_per_processor`  | low                             | Only matters if you later switch to `batch_process_documents`.                                          |
+| `prediction_long_running_requests_per_minute_per_processor`  | varies by region                | Each async job = 1 batch LRO. Raise this before increasing `OCR_WORKER_CONCURRENCY` heavily.            |
+| Batch pages per document                                     | up to processor limits (~2000+) | Fits the app's `MAX_PDF_PAGES` default.                                                                 |
+| Online `processDocument` requests                            | ~120 pages/min sustained        | Only affects sync `/v1/ocr` for small PDFs.                                                             |
 
 Numbers shift over time and per processor type. Always check the live values
 in the console.
@@ -42,27 +39,27 @@ gcloud alpha services quota list \
 
 ## How to request more
 
-For most online quotas you can self-serve up to a moderate ceiling; larger
+For most batch quotas you can self-serve up to a moderate ceiling; larger
 asks go through Google review.
 
 GUI:
 
-1. On the Quotas page, tick the row for the metric you want to raise.
+1. On the Quotas page, tick the row for the batch metric you want to raise.
 2. Click **EDIT QUOTAS**.
-3. Enter the new value and a justification ("Searchable-PDF OCR API; expected
-    sustained 50 req/s, peak 100 req/s in region `us`").
+3. Enter the new value and a justification ("Searchable-PDF OCR API; async
+    batch jobs for 500 MB / 1000-page PDFs in region `us`").
 4. Submit.
 
 CLI:
 
 ```bash
-# Example: raise online-process requests per minute to 6000 for region `us`.
+# Example: raise batch LRO requests per minute for region `us`.
 gcloud alpha services quota update \
     --service=documentai.googleapis.com \
     --consumer=projects/$(gcloud config get-value project) \
-    --metric=documentai.googleapis.com/processor_request_per_minute_per_project_per_region \
-    --unit=1/min/{project}/{region} \
-    --value=6000 \
+    --metric=documentai.googleapis.com/prediction_long_running_requests_per_minute_per_processor \
+    --unit=1/min/{project}/{region}/{processor} \
+    --value=120 \
     --dimensions=region=us
 ```
 
@@ -74,18 +71,21 @@ business days for large ones.
 Keep this rule in mind when tuning [`ocrapi.env.example`](./ocrapi.env.example):
 
 ```
-peak_req_per_sec  =  (OCR_WORKER_CONCURRENCY * OCRMYPDF_JOBS) / avg_seconds_per_page
+peak_batch_jobs_per_min  ~=  OCR_WORKER_CONCURRENCY / avg_minutes_per_job
 ```
 
-With `OCR_WORKER_CONCURRENCY=4`, `OCRMYPDF_JOBS=8`, and ~1.5s per page on
-Document AI, peak ≈ `32 / 1.5 ≈ 21 req/s ≈ 1,260 req/min`. That fits under the
-default 1,800 req/min with headroom. If you raise either knob, also raise the
-processor quota first.
+With `OCR_WORKER_CONCURRENCY=4` and a 1000-page PDF finishing in ~15 minutes,
+peak ≈ `4 / 15 ≈ 0.27 batch jobs/min`. That is well within typical batch
+quotas. If you run many concurrent large jobs, raise the batch LRO quota first.
 
 ## Signs you need a quota bump
 
-- `RESOURCE_EXHAUSTED` errors in `journalctl -u ocrapi.service`
-- Jobs failing with `OCR pipeline failed: 429 ...` after the tenacity retry
-    chain exhausts (`stop_after_attempt(5)` in
-    [`ocr_documentai_plugin/documentai_client.py`](../../ocr_documentai_plugin/documentai_client.py))
-- Latency per page suddenly rising (Google is throttling, not erroring).
+- `RESOURCE_EXHAUSTED` errors in `journalctl -u ocrapi.service` during batch submit
+- Jobs failing with `OCR pipeline failed: 429 ...` after retries exhaust
+- Batch operations stuck in `running` with rising queue depth across jobs
+
+## Cloud Storage
+
+Batch scratch lives in `GCS_BUCKET` (created by `01-provision.sh`) with a
+1-day lifecycle delete rule. No manual cleanup is required; ensure the service
+account has `roles/storage.objectAdmin` on that bucket.

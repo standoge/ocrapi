@@ -1,11 +1,9 @@
 # Deploying ocrapi to a single GCE VM
 
 This folder contains everything needed to run ocrapi on a Compute Engine VM
-with Docker and an attached 500 GB SSD for `JOBS_DIR` and the ocrmypdf scratch
-directory. It is the deployment target described in the project plan and fixes
-the root cause of the `[Errno 28] No space left on device` failure: rasterized
-pages now land on a large persistent disk instead of the VM's small root
-filesystem.
+with Docker, a data disk for `JOBS_DIR`, and a GCS bucket for Document AI batch
+scratch. Async jobs upload PDFs to GCS, run `batchProcessDocuments`, and the VM
+assembles searchable PDFs with PyMuPDF — no Ghostscript rasterization.
 
 The app is served directly over **plain HTTP on port 8000** (no TLS / reverse
 proxy). This is the simplest setup for testing. Note that uploads and results
@@ -17,16 +15,16 @@ nginx, or a GCP HTTPS Load Balancer) in front and bind the container to
 
 | File                                                 | Where it runs    | Purpose                                                            |
 | ---------------------------------------------------- | ---------------- | ------------------------------------------------------------------ |
-| [`01-provision.sh`](./01-provision.sh)               | dev machine      | Create SA, Artifact Registry repo, firewall, data disk, GCE VM.    |
+| [`01-provision.sh`](./01-provision.sh)               | dev machine      | Create SA, GCS bucket, Artifact Registry, firewall, data disk, VM. |
 | [`02-vm-setup.sh`](./02-vm-setup.sh)                 | VM (root)        | Format/mount data disk, install Docker, register systemd units.    |
 | [`03-build-and-push.sh`](./03-build-and-push.sh)     | dev machine      | Build linux/amd64 image, push to Artifact Registry.                |
 | [`04-run.sh`](./04-run.sh)                           | VM (root)        | Pin image tag, (re)start `ocrapi.service`, health-check.           |
-| [`ocrapi.env.example`](./ocrapi.env.example)         | VM (`/etc/ocrapi.env`) | Production env: tuned concurrency, paths, no key file.       |
-| [`ocrapi.service`](./ocrapi.service)                 | VM systemd unit  | Runs the container on `0.0.0.0:8000` with `TMPDIR=/data/tmp` and bind mounts. |
-| [`ocrapi-cleanup.sh`](./ocrapi-cleanup.sh)           | VM (`/usr/local/bin`) | Prunes old job folders and stale scratch.                     |
+| [`ocrapi.env.example`](./ocrapi.env.example)         | VM (`/etc/ocrapi.env`) | Production env: GCS bucket, concurrency, paths, no key file.   |
+| [`ocrapi.service`](./ocrapi.service)                 | VM systemd unit  | Runs the container on `0.0.0.0:8000` with `/data/jobs` bind mount. |
+| [`ocrapi-cleanup.sh`](./ocrapi-cleanup.sh)           | VM (`/usr/local/bin`) | Prunes old job folders.                                         |
 | [`ocrapi-cleanup.service`](./ocrapi-cleanup.service) | VM systemd unit  | Oneshot wrapper around the cleanup script.                         |
 | [`ocrapi-cleanup.timer`](./ocrapi-cleanup.timer)     | VM systemd timer | Runs the cleanup daily + 10 min after boot.                        |
-| [`QUOTA.md`](./QUOTA.md)                             | runbook          | How to verify and raise the Document AI quota ceiling.             |
+| [`QUOTA.md`](./QUOTA.md)                             | runbook          | How to verify and raise Document AI batch quota.                   |
 
 ## End-to-end deployment
 
@@ -47,7 +45,7 @@ gcloud compute ssh ocrapi-vm --zone=us-central1-a
 # Copy the deploy/ folder onto the VM (e.g. git clone the repo) and:
 sudo bash deploy/gcp/02-vm-setup.sh              # mounts /data, installs docker
 
-# Edit /etc/ocrapi.env if you need to change GCP_PROJECT_ID / processor / Drive ID
+# Edit /etc/ocrapi.env if you need to change GCP_PROJECT_ID / processor / GCS bucket / Drive ID
 sudoedit /etc/ocrapi.env
 
 # --- back on dev machine ---
@@ -75,7 +73,7 @@ sudo journalctl -u ocrapi.service -f
 
 # Disk usage on the data volume
 df -h /data
-du -sh /data/jobs /data/tmp
+du -sh /data/jobs
 
 # Manual cleanup (defaults to 7 days)
 sudo RETENTION_DAYS=3 /usr/local/bin/ocrapi-cleanup.sh
@@ -87,31 +85,18 @@ sudo IMAGE=us-central1-docker.pkg.dev/YOUR_PROJECT/ocrapi/ocrapi:NEW_TAG \
      bash deploy/gcp/04-run.sh
 ```
 
-## What was changed in the repo
+## Architecture notes
 
-- [`Dockerfile`](../../Dockerfile): removed `tesseract-ocr*` packages (the
-    plugin disables Tesseract anyway and Document AI is the sole OCR engine),
-    pinned `--workers 1` on uvicorn so the in-process `JobManager` queue isn't
-    sharded across worker processes.
-
-Everything else lives under this folder; the application code is untouched.
-
-## How the disk-space failure is fixed
-
-`ocrmypdf` rasterizes each PDF page at 300 DPI via Ghostscript into the system
-temp dir before calling the OCR engine. On the local Windows machine, the
-container's `/tmp` was on the small root filesystem; a 700 MB / 2000-page PDF
-can produce tens of GB of scratch.
-
-The systemd unit ([`ocrapi.service`](./ocrapi.service)) sets `TMPDIR=/data/tmp`
-and bind-mounts the host's `/data/tmp` (on the 500 GB Hyperdisk) into the
-container. Python's `tempfile` honors `TMPDIR`, and ocrmypdf uses `tempfile`,
-so all scratch lands on the big disk. `JOBS_DIR` is bind-mounted the same
-way. The retention timer keeps both directories from growing without bound.
+- **Async jobs** (`POST /v1/jobs`): upload PDF to GCS → Document AI batch OCR →
+  download JSON shards → PyMuPDF invisible text layer → local `output.pdf`.
+- **Sync OCR** (`POST /v1/ocr`): online `processDocument` on the whole PDF (small
+  docs only) → same PyMuPDF injector.
+- **GCS scratch** is auto-deleted after 1 day via bucket lifecycle rule.
+- Default VM sizing is `c4-standard-4` with a 50 GB data disk (input/output PDFs
+  only; no page rasterization scratch).
 
 ## Performance tuning
 
-See [`QUOTA.md`](./QUOTA.md). Short version: the limiting factor for sustained
-throughput is the Document AI online-process quota for your processor, not the
-VM. Confirm and raise it before turning up `OCR_WORKER_CONCURRENCY` or
-`OCRMYPDF_JOBS` past the defaults shipped in `ocrapi.env.example`.
+See [`QUOTA.md`](./QUOTA.md). The limiting factor for large async jobs is
+Document AI **batch** quota, not VM CPU. Confirm and raise it before turning up
+`OCR_WORKER_CONCURRENCY` past the defaults shipped in `ocrapi.env.example`.
