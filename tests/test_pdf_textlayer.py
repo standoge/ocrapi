@@ -1,11 +1,14 @@
-"""Unit tests for Document AI -> hOCR conversion."""
+"""Unit tests for Document AI -> searchable PDF text-layer injection."""
 
 from __future__ import annotations
 
+from pathlib import Path
+
+import fitz
 from google.cloud.documentai_v1.types import document as documentai_document
 from google.cloud.documentai_v1.types.geometry import NormalizedVertex
 
-from ocr_documentai_plugin.hocr import document_to_hocr
+from ocr_documentai_plugin.pdf_textlayer import inject_text_layer
 
 
 def _vertex(x: float, y: float) -> NormalizedVertex:
@@ -15,16 +18,6 @@ def _vertex(x: float, y: float) -> NormalizedVertex:
 def _make_document() -> documentai_document.Document:
     document = documentai_document.Document(text="Hello world")
     page = documentai_document.Document.Page(page_number=1)
-
-    line = documentai_document.Document.Page.Line()
-    line.layout.text_anchor.text_segments.append(
-        documentai_document.Document.TextAnchor.TextSegment(start_index=0, end_index=11)
-    )
-    line.layout.bounding_poly.normalized_vertices.extend(
-        [_vertex(0.1, 0.1), _vertex(0.9, 0.1), _vertex(0.9, 0.2), _vertex(0.1, 0.2)]
-    )
-    line.layout.confidence = 0.95
-    page.lines.append(line)
 
     token1 = documentai_document.Document.Page.Token()
     token1.layout.text_anchor.text_segments.append(
@@ -50,13 +43,22 @@ def _make_document() -> documentai_document.Document:
     return document
 
 
-def test_document_to_hocr_contains_words_and_sidecar():
-    document = _make_document()
-    hocr_xml, sidecar = document_to_hocr(document, image_width=1000, image_height=2000)
+def test_inject_text_layer_writes_searchable_pdf(tmp_path: Path):
+    input_pdf = tmp_path / "input.pdf"
+    output_pdf = tmp_path / "output.pdf"
 
-    assert "ocrx_word" in hocr_xml
-    assert "Hello" in hocr_xml
-    assert "world" in hocr_xml
-    assert "x_wconf 98" in hocr_xml
-    assert "bbox 100 200 449 400" in hocr_xml
-    assert "Hello world" in sidecar
+    with fitz.open() as pdf:
+        page = pdf.new_page(width=612, height=792)
+        page.insert_text((72, 72), "visible anchor")
+        pdf.save(input_pdf)
+
+    processed_pages = inject_text_layer(input_pdf, [_make_document()], output_pdf)
+
+    assert processed_pages == 1
+    assert output_pdf.exists()
+
+    with fitz.open(output_pdf) as pdf:
+        text = pdf[0].get_text("text")
+
+    assert "Hello" in text
+    assert "world" in text

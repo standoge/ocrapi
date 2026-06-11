@@ -13,12 +13,12 @@ def _test_env() -> None:
     os.environ.setdefault("GCP_PROJECT_ID", "test-project")
     os.environ.setdefault("GCP_LOCATION", "us")
     os.environ.setdefault("GCP_PROCESSOR_ID", "test-processor")
+    os.environ.setdefault("GCS_BUCKET", "test-project-ocrapi-batch")
     os.environ.setdefault("DRIVE_SHARED_FOLDER_ID", "test-folder-id")
     os.environ.setdefault("MAX_UPLOAD_BYTES", "20971520")
     os.environ.setdefault("MAX_PDF_PAGES", "2000")
     os.environ.setdefault("SYNC_MAX_PAGES", "15")
     os.environ.setdefault("OCR_WORKER_CONCURRENCY", "1")
-    os.environ.setdefault("OCRMYPDF_JOBS", "1")
     os.environ.setdefault("LOG_LEVEL", "WARNING")
 
 
