@@ -30,6 +30,10 @@ class Settings(BaseSettings):
     max_pdf_pages: int = 2000
     sync_max_pages: int = 15
 
+    online_chunk_pages: int = 15
+    online_chunk_max_bytes: int = 18 * 1024 * 1024
+    online_max_concurrency: int = 8
+
     jobs_dir: str = "jobs"
     ocr_worker_concurrency: int = 4
 
