@@ -29,6 +29,13 @@ def _format_ocr_failure(exc: Exception, settings: Settings) -> str:
             "If the service account belongs to another project, add the role on the "
             "processor project explicitly."
         )
+    if "storage.objects" in message or "storage.buckets" in message:
+        sa_email = settings.service_account_email or "unknown service account"
+        return (
+            "GCP Cloud Storage permission denied for batch OCR. Grant "
+            f"'roles/storage.objectAdmin' on bucket '{settings.gcs_bucket}' to "
+            f"'{sa_email}'."
+        )
     return f"OCR pipeline failed: {exc}"
 
 

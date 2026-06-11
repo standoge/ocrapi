@@ -4,7 +4,7 @@ info:
   version: 1.0.0
   description: |
     REST API that accepts a PDF and returns a searchable PDF using GCP Document AI
-    via a custom ocrmypdf plugin. Includes an endpoint to store results in Google Drive.
+    and PyMuPDF text-layer injection. Includes an endpoint to store results in Google Drive.
   contact:
     name: DocAI OCR API
 servers:
@@ -29,8 +29,8 @@ paths:
       operationId: ocrPdf
       summary: OCR a PDF and return searchable PDF
       description: |
-        Accepts a PDF file via multipart upload, runs OCR using GCP Document AI
-        through ocrmypdf, and returns the same PDF with an embedded searchable text layer.
+        Accepts a PDF file via multipart upload, runs OCR using GCP Document AI,
+        and returns the same PDF with an embedded searchable text layer via PyMuPDF.
       tags:
         - OCR
       requestBody:

@@ -22,15 +22,16 @@ class Settings(BaseSettings):
 
     drive_shared_folder_id: str
 
+    gcs_bucket: str
+    batch_timeout_seconds: int = 1800
+    batch_poll_interval_seconds: int = 10
+
     max_upload_bytes: int = 600 * 1024 * 1024
     max_pdf_pages: int = 2000
     sync_max_pages: int = 15
 
     jobs_dir: str = "jobs"
     ocr_worker_concurrency: int = 4
-    ocrmypdf_jobs: int = 20
-    default_output_type: str = "pdf"
-    ocr_progress_logging: bool = True
 
     app_host: str = "0.0.0.0"
     app_port: int = 8000
