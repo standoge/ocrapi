@@ -9,7 +9,7 @@ import threading
 import time
 from typing import TYPE_CHECKING
 
-from google.api_core.exceptions import GoogleAPICallError, RetryError
+from google.api_core.exceptions import GoogleAPICallError, ResourceExhausted, RetryError
 from google.cloud import documentai_v1 as documentai
 from tenacity import (
     retry,
@@ -44,9 +44,11 @@ class DocumentAIClient:
         self._processor_name = settings.processor_resource_name
 
     @retry(
-        retry=retry_if_exception_type((GoogleAPICallError, RetryError)),
-        stop=stop_after_attempt(5),
-        wait=wait_exponential(multiplier=1, min=1, max=16),
+        retry=retry_if_exception_type(
+            (GoogleAPICallError, ResourceExhausted, RetryError)
+        ),
+        stop=stop_after_attempt(8),
+        wait=wait_exponential(multiplier=2, min=2, max=60),
         reraise=True,
     )
     def process_pdf_online(self, pdf_bytes: bytes) -> documentai.Document:
