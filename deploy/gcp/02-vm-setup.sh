@@ -56,8 +56,7 @@ if ! mountpoint -q "${MOUNT_POINT}"; then
   mount "${MOUNT_POINT}"
 fi
 
-mkdir -p "${MOUNT_POINT}/jobs" "${MOUNT_POINT}/tmp"
-chmod 1777 "${MOUNT_POINT}/tmp"
+mkdir -p "${MOUNT_POINT}/jobs"
 echo "==> ${MOUNT_POINT} ready: $(df -h "${MOUNT_POINT}" | tail -1)"
 
 ############################

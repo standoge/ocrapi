@@ -16,11 +16,12 @@ PROJECT_ID="${PROJECT_ID:-$(gcloud config get-value project 2>/dev/null)}"
 REGION="${REGION:-us-central1}"
 ZONE="${ZONE:-us-central1-a}"
 VM_NAME="${VM_NAME:-ocrapi-vm}"
-MACHINE_TYPE="${MACHINE_TYPE:-c4-standard-16}"
+MACHINE_TYPE="${MACHINE_TYPE:-c4-standard-4}"
 BOOT_DISK_SIZE="${BOOT_DISK_SIZE:-50GB}"
 BOOT_DISK_TYPE="${BOOT_DISK_TYPE:-hyperdisk-balanced}"
 DATA_DISK_NAME="${DATA_DISK_NAME:-ocrapi-data}"
-DATA_DISK_SIZE="${DATA_DISK_SIZE:-500GB}"
+DATA_DISK_SIZE="${DATA_DISK_SIZE:-50GB}"
+BUCKET="${BUCKET:-${PROJECT_ID}-ocrapi-batch}"
 DATA_DISK_TYPE="${DATA_DISK_TYPE:-hyperdisk-balanced}"
 SA_NAME="${SA_NAME:-ocrapi-sa}"
 SA_EMAIL="${SA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
@@ -48,6 +49,7 @@ gcloud services enable \
   iam.googleapis.com \
   logging.googleapis.com \
   monitoring.googleapis.com \
+  storage.googleapis.com \
   --project="${PROJECT_ID}"
 
 ############################
@@ -82,6 +84,33 @@ gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
   --role="roles/monitoring.metricWriter" \
   --condition=None >/dev/null
 
+############################
+# 3. GCS batch bucket      #
+############################
+echo "==> Ensuring GCS bucket gs://${BUCKET} in ${REGION}..."
+if ! gcloud storage buckets describe "gs://${BUCKET}" --project="${PROJECT_ID}" >/dev/null 2>&1; then
+  gcloud storage buckets create "gs://${BUCKET}" \
+    --project="${PROJECT_ID}" \
+    --location="${REGION}" \
+    --uniform-bucket-level-access
+fi
+
+LIFECYCLE_FILE="$(mktemp)"
+trap 'rm -f "${LIFECYCLE_FILE}"' EXIT
+cat > "${LIFECYCLE_FILE}" <<'JSON'
+{"rule":[{"action":{"type":"Delete"},"condition":{"age":1}}]}
+JSON
+echo "==> Applying 1-day lifecycle rule to gs://${BUCKET}..."
+gcloud storage buckets update "gs://${BUCKET}" \
+  --lifecycle-file="${LIFECYCLE_FILE}" \
+  --project="${PROJECT_ID}"
+
+echo "==> Granting storage.objectAdmin on gs://${BUCKET} to ${SA_EMAIL}..."
+gcloud storage buckets add-iam-policy-binding "gs://${BUCKET}" \
+  --member="serviceAccount:${SA_EMAIL}" \
+  --role="roles/storage.objectAdmin" \
+  --project="${PROJECT_ID}" >/dev/null
+
 cat <<EOF
 ==> Drive access is NOT granted via IAM. Share the Shared Drive folder
     (DRIVE_SHARED_FOLDER_ID) with this service account as Content Manager:
@@ -89,7 +118,7 @@ cat <<EOF
 EOF
 
 ############################
-# 3. Artifact Registry     #
+# 4. Artifact Registry     #
 ############################
 echo "==> Ensuring Artifact Registry repo '${AR_REPO}' in ${REGION}..."
 if ! gcloud artifacts repositories describe "${AR_REPO}" \
@@ -102,7 +131,7 @@ if ! gcloud artifacts repositories describe "${AR_REPO}" \
 fi
 
 ############################
-# 4. Firewall              #
+# 5. Firewall              #
 ############################
 echo "==> Configuring firewall..."
 # Plain HTTP: the app is served directly on port 8000 (no TLS/reverse proxy).
@@ -134,7 +163,7 @@ if ! gcloud compute firewall-rules describe ocrapi-allow-ssh \
 fi
 
 ############################
-# 5. Data disk             #
+# 6. Data disk             #
 ############################
 echo "==> Ensuring data disk '${DATA_DISK_NAME}' (${DATA_DISK_SIZE} ${DATA_DISK_TYPE})..."
 if ! gcloud compute disks describe "${DATA_DISK_NAME}" \
@@ -147,7 +176,7 @@ if ! gcloud compute disks describe "${DATA_DISK_NAME}" \
 fi
 
 ############################
-# 6. VM                    #
+# 7. VM                    #
 ############################
 echo "==> Ensuring VM '${VM_NAME}' (${MACHINE_TYPE})..."
 if ! gcloud compute instances describe "${VM_NAME}" \
@@ -191,6 +220,7 @@ Provisioning complete.
   External IP:     ${EXT_IP}
   Service account: ${SA_EMAIL}
   Data disk:       ${DATA_DISK_NAME} (${DATA_DISK_SIZE})
+  Batch bucket:    gs://${BUCKET}
   Artifact Repo:   ${REGION}-docker.pkg.dev/${PROJECT_ID}/${AR_REPO}
 
 Next steps:

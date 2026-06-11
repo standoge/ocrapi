@@ -1,5 +1,5 @@
 [Unit]
-Description=ocrapi (FastAPI + ocrmypdf + Document AI)
+Description=ocrapi (FastAPI + Document AI batch + PyMuPDF)
 Documentation=https://github.com/your-org/ocrapi
 Wants=network-online.target docker.service
 After=network-online.target docker.service data.mount
@@ -18,14 +18,9 @@ TimeoutStopSec=120
 ExecStartPre=-/usr/bin/docker rm -f ocrapi
 ExecStartPre=/usr/bin/docker pull ${IMAGE}
 
-# TMPDIR=/data/tmp keeps ocrmypdf scratch (Ghostscript rasterization output) on
-# the 500 GB Hyperdisk instead of the 50 GB root disk. This is the fix for
-# `[Errno 28] No space left on device`.
 ExecStart=/usr/bin/docker run --rm --name ocrapi \
   --env-file /etc/ocrapi.env \
-  -e TMPDIR=/data/tmp \
   -v /data/jobs:/data/jobs \
-  -v /data/tmp:/data/tmp \
   -p 0.0.0.0:8000:8000 \
   --log-driver=journald \
   --log-opt tag=ocrapi \
