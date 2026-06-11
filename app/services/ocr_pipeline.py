@@ -1,4 +1,4 @@
-"""OCR pipeline service wrapping ocrmypdf."""
+"""OCR pipeline service using Document AI and PyMuPDF."""
 
 from __future__ import annotations
 
@@ -7,12 +7,13 @@ import logging
 import tempfile
 from pathlib import Path
 
-import ocrmypdf
 from pypdf import PdfReader
 
 from app.config import Settings
 from app.exceptions import UnprocessablePdfError, UpstreamServiceError
-from app.services.ocr_progress import ocr_context
+from ocr_documentai_plugin.documentai_client import get_documentai_client
+from ocr_documentai_plugin.gcs_client import get_gcs_client
+from ocr_documentai_plugin.pdf_textlayer import inject_text_layer
 
 logger = logging.getLogger(__name__)
 
@@ -55,49 +56,64 @@ def _validate_pdf(
     return page_count
 
 
-def _run_ocr_sync(
+def _run_online_ocr_sync(
     input_path: Path,
     output_path: Path,
     settings: Settings,
     *,
-    output_type: str | None = None,
-    jobs: int | None = None,
-    progress_context: dict[str, str] | None = None,
-) -> None:
-    token = None
-    if progress_context:
-        token = ocr_context.set(progress_context)
+    max_pages: int | None = None,
+    job_id: str | None = None,
+    original_filename: str | None = None,
+) -> int:
+    page_count = _validate_pdf(input_path, settings, max_pages=max_pages)
+    filename = original_filename or input_path.name
+    log_prefix = f"[job={job_id[:8]} | {filename}] " if job_id else f"[{filename}] "
+    logger.info("%sRunning online Document AI OCR (%d pages)", log_prefix, page_count)
+
+    pdf_bytes = input_path.read_bytes()
+    document = get_documentai_client(settings).process_pdf_online(pdf_bytes)
+    processed_pages = inject_text_layer(input_path, [document], output_path)
+    logger.info("%sOnline OCR completed (%d pages)", log_prefix, processed_pages)
+    return page_count
+
+
+def _run_batch_ocr_sync(
+    input_path: Path,
+    output_path: Path,
+    settings: Settings,
+    *,
+    job_id: str | None = None,
+    original_filename: str | None = None,
+) -> int:
+    page_count = _validate_pdf(input_path, settings)
+    filename = original_filename or input_path.name
+    if not job_id:
+        raise UpstreamServiceError("Batch OCR requires a job_id")
+
+    log_prefix = f"[job={job_id[:8]} | {filename}] "
+    gcs_client = get_gcs_client(settings)
+    docai_client = get_documentai_client(settings)
+
+    input_prefix = f"{job_id}/input"
+    output_prefix = f"{job_id}/output"
+    input_blob = f"{input_prefix}/input.pdf"
+
+    logger.info("%sUploading input PDF to GCS (%d pages)", log_prefix, page_count)
+    gcs_client.upload_file(input_path, input_blob)
 
     try:
-        logger.info(
-            "Running ocrmypdf on %s -> %s",
-            input_path.name,
-            output_path.name,
+        documents = docai_client.batch_process_from_gcs(
+            gcs_client.gcs_prefix(input_prefix),
+            gcs_client.gcs_prefix(output_prefix),
+            gcs_client=gcs_client,
         )
-        ocrmypdf.ocr(
-            str(input_path),
-            str(output_path),
-            force_ocr=True,
-            output_type=output_type or settings.default_output_type,
-            progress_bar=settings.ocr_progress_logging,
-            optimize=0,
-            jobs=jobs if jobs is not None else settings.ocrmypdf_jobs,
-            ocr_engine="documentai",
-        )
-    except ocrmypdf.exceptions.PriorOcrFoundError as exc:
-        raise UnprocessablePdfError(str(exc)) from exc
-    except ocrmypdf.exceptions.EncryptedPdfError as exc:
-        raise UnprocessablePdfError(f"Encrypted PDF is not supported: {exc}") from exc
-    except ocrmypdf.exceptions.MissingDependencyError as exc:
-        raise UpstreamServiceError(
-            f"Missing system dependency for OCR pipeline: {exc}. "
-            "Install Ghostscript and qpdf (see README). Document AI is used for OCR; Tesseract is not required."
-        ) from exc
-    except Exception as exc:
-        raise UpstreamServiceError(_format_ocr_failure(exc, settings)) from exc
+        processed_pages = inject_text_layer(input_path, documents, output_path)
+        logger.info("%sBatch OCR completed (%d pages)", log_prefix, processed_pages)
     finally:
-        if token is not None:
-            ocr_context.reset(token)
+        logger.info("%sCleaning up GCS scratch prefix %s", log_prefix, job_id)
+        gcs_client.delete_prefix(f"{job_id}/")
+
+    return page_count
 
 
 def run_ocr_pipeline_file(
@@ -110,24 +126,16 @@ def run_ocr_pipeline_file(
     original_filename: str | None = None,
 ) -> int:
     """Run OCR on a PDF file and write the searchable PDF to disk."""
-    page_count = _validate_pdf(input_path, settings, max_pages=max_pages)
-    progress_context = {
-        "filename": original_filename or input_path.name,
-    }
-    if job_id:
-        progress_context["job_id"] = job_id
-
-    logger.info(
-        "Validated %s (%d pages)",
-        progress_context["filename"],
-        page_count,
-    )
-    _run_ocr_sync(
-        input_path,
-        output_path,
-        settings,
-        progress_context=progress_context,
-    )
+    try:
+        page_count = _run_batch_ocr_sync(
+            input_path,
+            output_path,
+            settings,
+            job_id=job_id,
+            original_filename=original_filename,
+        )
+    except Exception as exc:
+        raise UpstreamServiceError(_format_ocr_failure(exc, settings)) from exc
 
     if not output_path.exists():
         raise UpstreamServiceError("OCR completed but output PDF was not created")
@@ -143,18 +151,16 @@ async def run_ocr_pipeline(pdf_bytes: bytes, settings: Settings) -> tuple[bytes,
         output_path = tmp / "output.pdf"
         input_path.write_bytes(pdf_bytes)
 
-        page_count = _validate_pdf(
-            input_path,
-            settings,
-            max_pages=settings.sync_max_pages,
-        )
-        await asyncio.to_thread(
-            _run_ocr_sync,
-            input_path,
-            output_path,
-            settings,
-            progress_context={"filename": "upload.pdf"},
-        )
+        try:
+            page_count = await asyncio.to_thread(
+                _run_online_ocr_sync,
+                input_path,
+                output_path,
+                settings,
+                max_pages=settings.sync_max_pages,
+            )
+        except Exception as exc:
+            raise UpstreamServiceError(_format_ocr_failure(exc, settings)) from exc
 
         if not output_path.exists():
             raise UpstreamServiceError("OCR completed but output PDF was not created")
