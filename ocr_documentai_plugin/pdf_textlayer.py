@@ -101,19 +101,28 @@ def _inject_page_tokens(
         )
 
 
-def inject_text_layer(
-    input_pdf: Path,
+def _collect_page_entries(
     documents: list[documentai_document.Document],
-    output_pdf: Path,
-) -> int:
-    """Write a searchable PDF by overlaying invisible text from Document AI output."""
+    *,
+    page_offset: int = 0,
+) -> list[tuple[int, str, documentai_document.Document.Page]]:
     page_entries: list[tuple[int, str, documentai_document.Document.Page]] = []
     for document in documents:
         document_text = document.text or ""
+        local_fallback = 1
         for page_proto in document.pages:
-            page_number = page_proto.page_number or len(page_entries) + 1
+            local_page_number = page_proto.page_number or local_fallback
+            page_number = page_offset + local_page_number
             page_entries.append((page_number, document_text, page_proto))
+            local_fallback = local_page_number + 1
+    return page_entries
 
+
+def _write_text_layer(
+    input_pdf: Path,
+    page_entries: list[tuple[int, str, documentai_document.Document.Page]],
+    output_pdf: Path,
+) -> int:
     page_entries.sort(key=lambda item: item[0])
 
     with fitz.open(input_pdf) as pdf:
@@ -130,3 +139,32 @@ def inject_text_layer(
         pdf.save(output_pdf, garbage=4, deflate=True)
 
     return len(page_entries)
+
+
+def inject_text_layer(
+    input_pdf: Path,
+    documents: list[documentai_document.Document],
+    output_pdf: Path,
+) -> int:
+    """Write a searchable PDF by overlaying invisible text from Document AI output."""
+    page_entries = _collect_page_entries(documents)
+    return _write_text_layer(input_pdf, page_entries, output_pdf)
+
+
+def inject_text_layer_chunks(
+    input_pdf: Path,
+    chunk_results: list[tuple[int, documentai_document.Document]],
+    output_pdf: Path,
+) -> int:
+    """Write a searchable PDF from chunked Document AI results.
+
+    *chunk_results* is a list of ``(start_index, document)`` tuples where
+    *start_index* is the zero-based page index of the first page in the chunk
+    within the source PDF.
+    """
+    page_entries: list[tuple[int, str, documentai_document.Document.Page]] = []
+    for start_index, document in chunk_results:
+        page_entries.extend(
+            _collect_page_entries([document], page_offset=start_index)
+        )
+    return _write_text_layer(input_pdf, page_entries, output_pdf)

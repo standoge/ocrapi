@@ -8,7 +8,7 @@ import fitz
 from google.cloud.documentai_v1.types import document as documentai_document
 from google.cloud.documentai_v1.types.geometry import NormalizedVertex
 
-from ocr_documentai_plugin.pdf_textlayer import inject_text_layer
+from ocr_documentai_plugin.pdf_textlayer import inject_text_layer, inject_text_layer_chunks
 
 
 def _vertex(x: float, y: float) -> NormalizedVertex:
@@ -62,3 +62,47 @@ def test_inject_text_layer_writes_searchable_pdf(tmp_path: Path):
 
     assert "Hello" in text
     assert "world" in text
+
+
+def _make_document_for_page(page_number: int, text: str) -> documentai_document.Document:
+    document = documentai_document.Document(text=text)
+    page = documentai_document.Document.Page(page_number=page_number)
+
+    token = documentai_document.Document.Page.Token()
+    token.layout.text_anchor.text_segments.append(
+        documentai_document.Document.TextAnchor.TextSegment(
+            start_index=0,
+            end_index=len(text),
+        )
+    )
+    token.layout.bounding_poly.normalized_vertices.extend(
+        [_vertex(0.1, 0.1), _vertex(0.9, 0.1), _vertex(0.9, 0.2), _vertex(0.1, 0.2)]
+    )
+    page.tokens.append(token)
+    document.pages.append(page)
+    return document
+
+
+def test_inject_text_layer_chunks_maps_page_offsets(tmp_path: Path):
+    input_pdf = tmp_path / "input.pdf"
+    output_pdf = tmp_path / "output.pdf"
+
+    with fitz.open() as pdf:
+        for index in range(2):
+            page = pdf.new_page(width=612, height=792)
+            page.insert_text((72, 72), f"visible-{index + 1}")
+        pdf.save(input_pdf)
+
+    chunk_results = [
+        (0, _make_document_for_page(1, "chunk-one")),
+        (1, _make_document_for_page(1, "chunk-two")),
+    ]
+
+    processed_pages = inject_text_layer_chunks(input_pdf, chunk_results, output_pdf)
+
+    assert processed_pages == 2
+    assert output_pdf.exists()
+
+    with fitz.open(output_pdf) as pdf:
+        assert "chunk-one" in pdf[0].get_text("text")
+        assert "chunk-two" in pdf[1].get_text("text")
