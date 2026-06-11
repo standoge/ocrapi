@@ -86,8 +86,8 @@ There are two ways to run OCR: **synchronous** (hold the HTTP connection) and **
 
 1. A job folder is created under `JOBS_DIR/{jobId}/` with `meta.json`, and the upload is streamed to `input.pdf` (no full-file memory buffer).
 2. The job is enqueued; the API returns `202` with a `statusUrl` immediately.
-3. A background worker picks up the job, sets status to `running`, and runs `run_ocr_pipeline_file()` on disk.
-4. On success, `output.pdf` is written and status becomes `succeeded`. Optional Drive upload runs after OCR; failure there is recorded in `driveUploadError` without changing job status to `failed`.
+3. A background worker picks up the job, sets status to `running`, splits the PDF into byte-aware chunks, and runs concurrent online `processDocument` calls (`ONLINE_MAX_CONCURRENCY`) via `run_ocr_pipeline_file()`.
+4. PyMuPDF overlays invisible text from all chunk results, writes `output.pdf`, and status becomes `succeeded`. Optional Drive upload runs after OCR; failure there is recorded in `driveUploadError` without changing job status to `failed`.
 5. Client polls `GET /v1/jobs/{jobId}` and downloads via `GET /v1/jobs/{jobId}/result` when ready.
 
 ```mermaid
@@ -165,16 +165,19 @@ Application errors map to [RFC 7807 Problem Details](https://datatracker.ietf.or
 
 ### Concurrency and resources
 
-Two layers of parallelism stack:
+Two layers of parallelism stack for async jobs:
 
 | Layer | Setting | What it controls |
 |-------|---------|------------------|
 | Job workers | `OCR_WORKER_CONCURRENCY` | How many PDFs are OCR'd at once (async jobs) |
-| Page workers | `OCRMYPDF_JOBS` | How many pages ocrmypdf processes in parallel within one PDF |
+| Chunk workers | `ONLINE_MAX_CONCURRENCY` | How many online `processDocument` calls run in parallel per PDF |
 
-Rough CPU load ≈ `OCR_WORKER_CONCURRENCY × OCRMYPDF_JOBS`. Sync requests also invoke ocrmypdf with page parallelism but do not use the job queue.
+Peak concurrent online calls ≈ `OCR_WORKER_CONCURRENCY × ONLINE_MAX_CONCURRENCY`.
+The throughput ceiling is Document AI **online pages/min** quota (~120/min
+sustained by default). See `deploy/gcp/QUOTA.md` before raising concurrency.
 
-Because every page is rasterized before OCR, disk usage can spike well above the upload size (temp files under `JOBS_DIR` and the system temp directory). Plan capacity accordingly for large or concurrent jobs.
+Disk usage is dominated by input/output PDFs under `JOBS_DIR`; there is no
+per-page rasterization scratch.
 
 ## Prerequisites
 
@@ -266,21 +269,22 @@ curl -X POST http://localhost:8000/v1/ocr/drive \
 | `MAX_UPLOAD_BYTES` | `629145600` (600 MB) | Maximum upload size for job and sync endpoints |
 | `MAX_PDF_PAGES` | `2000` | Maximum pages for async job processing |
 | `SYNC_MAX_PAGES` | `15` | Maximum pages for sync `/v1/ocr` and `/v1/ocr/drive` |
+| `ONLINE_CHUNK_PAGES` | `15` | Maximum pages per online OCR chunk (async jobs) |
+| `ONLINE_CHUNK_MAX_BYTES` | `18874368` (18 MB) | Maximum bytes per online OCR chunk |
+| `ONLINE_MAX_CONCURRENCY` | `8` | Concurrent online `processDocument` calls per async job |
 | `JOBS_DIR` | `jobs` | Directory for job input/output files |
-| `OCR_WORKER_CONCURRENCY` | `2` | Number of PDFs processed in parallel |
-| `OCRMYPDF_JOBS` | `2` | ocrmypdf page-level parallelism per PDF |
-| `DEFAULT_OUTPUT_TYPE` | `pdf` | ocrmypdf output type (`pdf` or `pdfa`) |
-| `OCR_PROGRESS_LOGGING` | `true` | Log page-level OCR progress to the terminal |
+| `OCR_WORKER_CONCURRENCY` | `4` | Number of PDFs processed in parallel |
 
 ### Concurrency tuning
 
-Total CPU pressure is roughly `OCR_WORKER_CONCURRENCY * OCRMYPDF_JOBS`. Tune so this does not exceed available CPU cores on your server.
-
-Example for an 8-core machine: `OCR_WORKER_CONCURRENCY=2` and `OCRMYPDF_JOBS=2` (4 effective workers).
+Peak online calls ≈ `OCR_WORKER_CONCURRENCY × ONLINE_MAX_CONCURRENCY`. Lower
+`ONLINE_MAX_CONCURRENCY` if you see `429 RESOURCE_EXHAUSTED`; raise Document
+AI online pages/min quota before increasing both knobs. See `deploy/gcp/QUOTA.md`.
 
 ### Disk space
 
-ocrmypdf rasterizes every page at 300 DPI before calling Document AI. A 500 MB, 1000-page PDF can require several GB of temporary disk space per concurrent job. Ensure ample free space under `JOBS_DIR` and the system temp directory.
+Async jobs store `input.pdf` and `output.pdf` under `JOBS_DIR`. Plan retention
+for large uploads (e.g. 500 MB × concurrent jobs).
 
 Job folders are not automatically deleted; plan a retention sweep for old jobs.
 

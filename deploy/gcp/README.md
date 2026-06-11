@@ -1,8 +1,9 @@
 # Deploying ocrapi to a single GCE VM
 
 This folder contains everything needed to run ocrapi on a Compute Engine VM
-with Docker, a data disk for `JOBS_DIR`, and a GCS bucket for Document AI batch
-scratch. Async jobs upload PDFs to GCS, run `batchProcessDocuments`, and the VM
+with Docker, a data disk for `JOBS_DIR`, and a GCS bucket (legacy batch
+scratch, unused by the current job pipeline). Async jobs split PDFs into
+small chunks, run concurrent online `processDocument` calls, and the VM
 assembles searchable PDFs with PyMuPDF — no Ghostscript rasterization.
 
 The app is served directly over **plain HTTP on port 8000** (no TLS / reverse
@@ -24,7 +25,7 @@ nginx, or a GCP HTTPS Load Balancer) in front and bind the container to
 | [`ocrapi-cleanup.sh`](./ocrapi-cleanup.sh)           | VM (`/usr/local/bin`) | Prunes old job folders.                                         |
 | [`ocrapi-cleanup.service`](./ocrapi-cleanup.service) | VM systemd unit  | Oneshot wrapper around the cleanup script.                         |
 | [`ocrapi-cleanup.timer`](./ocrapi-cleanup.timer)     | VM systemd timer | Runs the cleanup daily + 10 min after boot.                        |
-| [`QUOTA.md`](./QUOTA.md)                             | runbook          | How to verify and raise Document AI batch quota.                   |
+| [`QUOTA.md`](./QUOTA.md)                             | runbook          | How to verify and raise Document AI online OCR quota.              |
 
 ## End-to-end deployment
 
@@ -87,16 +88,18 @@ sudo IMAGE=us-central1-docker.pkg.dev/YOUR_PROJECT/ocrapi/ocrapi:NEW_TAG \
 
 ## Architecture notes
 
-- **Async jobs** (`POST /v1/jobs`): upload PDF to GCS → Document AI batch OCR →
-  download JSON shards → PyMuPDF invisible text layer → local `output.pdf`.
+- **Async jobs** (`POST /v1/jobs`): split PDF into chunks → concurrent online
+  `processDocument` per chunk → PyMuPDF invisible text layer → local
+  `output.pdf`.
 - **Sync OCR** (`POST /v1/ocr`): online `processDocument` on the whole PDF (small
   docs only) → same PyMuPDF injector.
-- **GCS scratch** is auto-deleted after 1 day via bucket lifecycle rule.
+- **GCS bucket** is provisioned but unused by the current async pipeline.
 - Default VM sizing is `c4-standard-4` with a 50 GB data disk (input/output PDFs
   only; no page rasterization scratch).
 
 ## Performance tuning
 
 See [`QUOTA.md`](./QUOTA.md). The limiting factor for large async jobs is
-Document AI **batch** quota, not VM CPU. Confirm and raise it before turning up
-`OCR_WORKER_CONCURRENCY` past the defaults shipped in `ocrapi.env.example`.
+Document AI **online** pages/min quota, not VM CPU. Confirm and raise it
+before turning up `OCR_WORKER_CONCURRENCY` or `ONLINE_MAX_CONCURRENCY` past
+the defaults shipped in `ocrapi.env.example`.
