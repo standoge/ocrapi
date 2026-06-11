@@ -31,9 +31,6 @@ dev = [
     "openapi-spec-validator>=0.7.1",
 ]
 
-[project.entry-points."ocrmypdf"]
-documentai = "ocr_documentai_plugin"
-
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["app*", "ocr_documentai_plugin*"]
