@@ -7,6 +7,7 @@ import logging
 import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from time import perf_counter
 
 from google.cloud.documentai_v1.types import document as documentai_document
 from pypdf import PdfReader
@@ -92,9 +93,11 @@ def _process_chunk_online(
     start_index: int,
     chunk_bytes: bytes,
     settings: Settings,
-) -> tuple[int, int, documentai_document.Document]:
+) -> tuple[int, int, documentai_document.Document, float]:
+    chunk_start = perf_counter()
     document = get_documentai_client(settings).process_pdf_online(chunk_bytes)
-    return chunk_index, start_index, document
+    elapsed = perf_counter() - chunk_start
+    return chunk_index, start_index, document, elapsed
 
 
 def _run_chunked_online_sync(
@@ -105,14 +108,24 @@ def _run_chunked_online_sync(
     job_id: str | None = None,
     original_filename: str | None = None,
 ) -> int:
+    pipeline_start = perf_counter()
     page_count = _validate_pdf(input_path, settings)
     filename = original_filename or input_path.name
     log_prefix = f"[job={job_id[:8]} | {filename}] " if job_id else f"[{filename}] "
 
+    split_start = perf_counter()
     chunks = split_pdf(
         input_path,
         max_pages=settings.online_chunk_pages,
         max_bytes=settings.online_chunk_max_bytes,
+    )
+    split_seconds = perf_counter() - split_start
+    logger.info(
+        "%sSplit %d pages into %d chunks in %.1fs",
+        log_prefix,
+        page_count,
+        len(chunks),
+        split_seconds,
     )
     logger.info(
         "%sRunning chunked online Document AI OCR (%d pages, %d chunks, concurrency=%d)",
@@ -125,7 +138,10 @@ def _run_chunked_online_sync(
     ordered_results: list[tuple[int, documentai_document.Document] | None] = [
         None
     ] * len(chunks)
+    chunk_elapsed: list[float] = []
     max_workers = min(settings.online_max_concurrency, len(chunks))
+    ocr_start = perf_counter()
+    completed_chunks = 0
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {
@@ -139,8 +155,41 @@ def _run_chunked_online_sync(
             for chunk_index, (start_index, chunk_bytes) in enumerate(chunks)
         }
         for future in as_completed(futures):
-            chunk_index, start_index, document = future.result()
+            chunk_index, start_index, document, elapsed = future.result()
             ordered_results[chunk_index] = (start_index, document)
+            chunk_elapsed.append(elapsed)
+            completed_chunks += 1
+            chunk_page_count = len(document.pages)
+            first_page = start_index + 1
+            last_page = start_index + chunk_page_count
+            logger.info(
+                "%sOCR progress %d/%d (pages %d-%d) chunk=%.1fs elapsed=%.1fs",
+                log_prefix,
+                completed_chunks,
+                len(chunks),
+                first_page,
+                last_page,
+                elapsed,
+                perf_counter() - ocr_start,
+            )
+
+    ocr_seconds = perf_counter() - ocr_start
+    pages_per_min = page_count / (ocr_seconds / 60) if ocr_seconds > 0 else 0.0
+    if chunk_elapsed:
+        min_chunk = min(chunk_elapsed)
+        max_chunk = max(chunk_elapsed)
+        avg_chunk = sum(chunk_elapsed) / len(chunk_elapsed)
+        chunk_stats = f"chunk min/avg/max={min_chunk:.1f}/{avg_chunk:.1f}/{max_chunk:.1f}s"
+    else:
+        chunk_stats = "chunk min/avg/max=n/a"
+    logger.info(
+        "%sChunk OCR finished: %d chunks in %.1fs (~%.0f pages/min; %s)",
+        log_prefix,
+        len(chunks),
+        ocr_seconds,
+        pages_per_min,
+        chunk_stats,
+    )
 
     chunk_results = [
         result for result in ordered_results if result is not None
@@ -148,7 +197,29 @@ def _run_chunked_online_sync(
     if len(chunk_results) != len(chunks):
         raise UpstreamServiceError("OCR pipeline failed: missing chunk results")
 
-    processed_pages = inject_text_layer_chunks(input_path, chunk_results, output_path)
+    textlayer_start = perf_counter()
+    processed_pages = inject_text_layer_chunks(
+        input_path,
+        chunk_results,
+        output_path,
+        log_prefix=log_prefix,
+    )
+    textlayer_seconds = perf_counter() - textlayer_start
+    total_seconds = perf_counter() - pipeline_start
+    logger.info(
+        "%sText layer (inject+save) finished in %.1fs",
+        log_prefix,
+        textlayer_seconds,
+    )
+    logger.info(
+        "%sTiming breakdown: split=%.1fs ocr=%.1fs (%.0f pages/min) textlayer=%.1fs total=%.1fs",
+        log_prefix,
+        split_seconds,
+        ocr_seconds,
+        pages_per_min,
+        textlayer_seconds,
+        total_seconds,
+    )
     logger.info("%sChunked online OCR completed (%d pages)", log_prefix, processed_pages)
     return page_count
 

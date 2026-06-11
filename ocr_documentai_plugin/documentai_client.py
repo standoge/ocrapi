@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING
 from google.api_core.exceptions import GoogleAPICallError, ResourceExhausted, RetryError
 from google.cloud import documentai_v1 as documentai
 from tenacity import (
+    before_sleep_log,
     retry,
     retry_if_exception_type,
     stop_after_attempt,
@@ -49,6 +50,7 @@ class DocumentAIClient:
         ),
         stop=stop_after_attempt(8),
         wait=wait_exponential(multiplier=2, min=2, max=60),
+        before_sleep=before_sleep_log(logger, logging.WARNING),
         reraise=True,
     )
     def process_pdf_online(self, pdf_bytes: bytes) -> documentai.Document:

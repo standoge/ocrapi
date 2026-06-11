@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
+from time import perf_counter
 
 import fitz
 from google.cloud.documentai_v1.types import document as documentai_document
+
+logger = logging.getLogger(__name__)
 
 
 def _text_from_anchor(document_text: str, text_anchor) -> str:
@@ -122,6 +126,8 @@ def _write_text_layer(
     input_pdf: Path,
     page_entries: list[tuple[int, str, documentai_document.Document.Page]],
     output_pdf: Path,
+    *,
+    log_prefix: str = "",
 ) -> int:
     page_entries.sort(key=lambda item: item[0])
 
@@ -129,14 +135,33 @@ def _write_text_layer(
         if len(pdf) == 0:
             raise ValueError("PDF contains no pages")
 
+        inject_start = perf_counter()
+        injected_pages = 0
         for page_number, document_text, page_proto in page_entries:
             page_index = page_number - 1
             if page_index < 0 or page_index >= len(pdf):
                 continue
             _inject_page_tokens(pdf[page_index], document_text, page_proto)
+            injected_pages += 1
+        inject_seconds = perf_counter() - inject_start
+        if log_prefix:
+            logger.info(
+                "%sInjected text on %d pages in %.1fs",
+                log_prefix,
+                injected_pages,
+                inject_seconds,
+            )
 
         output_pdf.parent.mkdir(parents=True, exist_ok=True)
+        save_start = perf_counter()
         pdf.save(output_pdf, garbage=4, deflate=True)
+        save_seconds = perf_counter() - save_start
+        if log_prefix:
+            logger.info(
+                "%sSaved searchable PDF (garbage=4, deflate) in %.1fs",
+                log_prefix,
+                save_seconds,
+            )
 
     return len(page_entries)
 
@@ -145,16 +170,20 @@ def inject_text_layer(
     input_pdf: Path,
     documents: list[documentai_document.Document],
     output_pdf: Path,
+    *,
+    log_prefix: str = "",
 ) -> int:
     """Write a searchable PDF by overlaying invisible text from Document AI output."""
     page_entries = _collect_page_entries(documents)
-    return _write_text_layer(input_pdf, page_entries, output_pdf)
+    return _write_text_layer(input_pdf, page_entries, output_pdf, log_prefix=log_prefix)
 
 
 def inject_text_layer_chunks(
     input_pdf: Path,
     chunk_results: list[tuple[int, documentai_document.Document]],
     output_pdf: Path,
+    *,
+    log_prefix: str = "",
 ) -> int:
     """Write a searchable PDF from chunked Document AI results.
 
@@ -167,4 +196,4 @@ def inject_text_layer_chunks(
         page_entries.extend(
             _collect_page_entries([document], page_offset=start_index)
         )
-    return _write_text_layer(input_pdf, page_entries, output_pdf)
+    return _write_text_layer(input_pdf, page_entries, output_pdf, log_prefix=log_prefix)
