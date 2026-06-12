@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import shutil
 from pathlib import Path
 from time import perf_counter
 
@@ -76,7 +77,7 @@ def _iter_tokens(document_text: str, page_proto):
             yield text, vertices
 
 
-def _inject_page_tokens(
+def _inject_page_tokens_legacy(
     pdf_page: fitz.Page,
     document_text: str,
     page_proto: documentai_document.Document.Page,
@@ -105,6 +106,42 @@ def _inject_page_tokens(
         )
 
 
+def _inject_page_tokens_textwriter(
+    pdf_page: fitz.Page,
+    document_text: str,
+    page_proto: documentai_document.Document.Page,
+    font: fitz.Font,
+) -> None:
+    tw = fitz.TextWriter(pdf_page.rect)
+    wrote = False
+    for text, vertices in _iter_tokens(document_text, page_proto):
+        rect = _normalized_rect_to_pdf(pdf_page, vertices)
+        if rect.is_empty or rect.width <= 0 or rect.height <= 0:
+            continue
+        fontsize = max(4.0, min(rect.height * 0.85, rect.width / max(len(text), 1)))
+        try:
+            tw.append(rect.bl, text, font=font, fontsize=fontsize)
+            wrote = True
+        except Exception:
+            continue
+    if wrote:
+        tw.write_text(pdf_page, render_mode=3)
+
+
+def _inject_page_tokens(
+    pdf_page: fitz.Page,
+    document_text: str,
+    page_proto: documentai_document.Document.Page,
+    *,
+    font: fitz.Font | None = None,
+    use_textwriter: bool = True,
+) -> None:
+    if use_textwriter and font is not None:
+        _inject_page_tokens_textwriter(pdf_page, document_text, page_proto, font)
+    else:
+        _inject_page_tokens_legacy(pdf_page, document_text, page_proto)
+
+
 def _collect_page_entries(
     documents: list[documentai_document.Document],
     *,
@@ -128,20 +165,36 @@ def _write_text_layer(
     output_pdf: Path,
     *,
     log_prefix: str = "",
+    save_incremental: bool = True,
+    use_textwriter: bool = True,
 ) -> int:
     page_entries.sort(key=lambda item: item[0])
+    output_pdf.parent.mkdir(parents=True, exist_ok=True)
 
-    with fitz.open(input_pdf) as pdf:
+    if save_incremental:
+        shutil.copyfile(input_pdf, output_pdf)
+        pdf_path = output_pdf
+    else:
+        pdf_path = input_pdf
+
+    with fitz.open(pdf_path) as pdf:
         if len(pdf) == 0:
             raise ValueError("PDF contains no pages")
 
+        font = fitz.Font("helv") if use_textwriter else None
         inject_start = perf_counter()
         injected_pages = 0
         for page_number, document_text, page_proto in page_entries:
             page_index = page_number - 1
             if page_index < 0 or page_index >= len(pdf):
                 continue
-            _inject_page_tokens(pdf[page_index], document_text, page_proto)
+            _inject_page_tokens(
+                pdf[page_index],
+                document_text,
+                page_proto,
+                font=font,
+                use_textwriter=use_textwriter,
+            )
             injected_pages += 1
         inject_seconds = perf_counter() - inject_start
         if log_prefix:
@@ -152,14 +205,19 @@ def _write_text_layer(
                 inject_seconds,
             )
 
-        output_pdf.parent.mkdir(parents=True, exist_ok=True)
         save_start = perf_counter()
-        pdf.save(output_pdf, garbage=4, deflate=True)
+        if save_incremental:
+            pdf.save(output_pdf, incremental=True, encryption=fitz.PDF_ENCRYPT_KEEP)
+            save_mode = "incremental"
+        else:
+            pdf.save(output_pdf, garbage=4, deflate=True)
+            save_mode = "garbage=4, deflate"
         save_seconds = perf_counter() - save_start
         if log_prefix:
             logger.info(
-                "%sSaved searchable PDF (garbage=4, deflate) in %.1fs",
+                "%sSaved searchable PDF (%s) in %.1fs",
                 log_prefix,
+                save_mode,
                 save_seconds,
             )
 
@@ -172,10 +230,19 @@ def inject_text_layer(
     output_pdf: Path,
     *,
     log_prefix: str = "",
+    save_incremental: bool = True,
+    use_textwriter: bool = True,
 ) -> int:
     """Write a searchable PDF by overlaying invisible text from Document AI output."""
     page_entries = _collect_page_entries(documents)
-    return _write_text_layer(input_pdf, page_entries, output_pdf, log_prefix=log_prefix)
+    return _write_text_layer(
+        input_pdf,
+        page_entries,
+        output_pdf,
+        log_prefix=log_prefix,
+        save_incremental=save_incremental,
+        use_textwriter=use_textwriter,
+    )
 
 
 def inject_text_layer_chunks(
@@ -184,6 +251,8 @@ def inject_text_layer_chunks(
     output_pdf: Path,
     *,
     log_prefix: str = "",
+    save_incremental: bool = True,
+    use_textwriter: bool = True,
 ) -> int:
     """Write a searchable PDF from chunked Document AI results.
 
@@ -196,4 +265,11 @@ def inject_text_layer_chunks(
         page_entries.extend(
             _collect_page_entries([document], page_offset=start_index)
         )
-    return _write_text_layer(input_pdf, page_entries, output_pdf, log_prefix=log_prefix)
+    return _write_text_layer(
+        input_pdf,
+        page_entries,
+        output_pdf,
+        log_prefix=log_prefix,
+        save_incremental=save_incremental,
+        use_textwriter=use_textwriter,
+    )

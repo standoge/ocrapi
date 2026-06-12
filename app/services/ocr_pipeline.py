@@ -22,6 +22,13 @@ from ocr_documentai_plugin.pdf_textlayer import inject_text_layer, inject_text_l
 logger = logging.getLogger(__name__)
 
 
+def _textlayer_kwargs(settings: Settings) -> dict[str, bool]:
+    return {
+        "save_incremental": settings.pdf_save_incremental,
+        "use_textwriter": settings.pdf_use_textwriter,
+    }
+
+
 def _format_ocr_failure(exc: Exception, settings: Settings) -> str:
     message = str(exc)
     if "documentai.processors.processOnline" in message or "IAM_PERMISSION_DENIED" in message:
@@ -83,7 +90,12 @@ def _run_online_ocr_sync(
 
     pdf_bytes = input_path.read_bytes()
     document = get_documentai_client(settings).process_pdf_online(pdf_bytes)
-    processed_pages = inject_text_layer(input_path, [document], output_path)
+    processed_pages = inject_text_layer(
+        input_path,
+        [document],
+        output_path,
+        **_textlayer_kwargs(settings),
+    )
     logger.info("%sOnline OCR completed (%d pages)", log_prefix, processed_pages)
     return page_count
 
@@ -203,6 +215,7 @@ def _run_chunked_online_sync(
         chunk_results,
         output_path,
         log_prefix=log_prefix,
+        **_textlayer_kwargs(settings),
     )
     textlayer_seconds = perf_counter() - textlayer_start
     total_seconds = perf_counter() - pipeline_start
@@ -254,7 +267,12 @@ def _run_batch_ocr_sync(
             gcs_client.gcs_prefix(output_prefix),
             gcs_client=gcs_client,
         )
-        processed_pages = inject_text_layer(input_path, documents, output_path)
+        processed_pages = inject_text_layer(
+            input_path,
+            documents,
+            output_path,
+            **_textlayer_kwargs(settings),
+        )
         logger.info("%sBatch OCR completed (%d pages)", log_prefix, processed_pages)
     finally:
         logger.info("%sCleaning up GCS scratch prefix %s", log_prefix, job_id)

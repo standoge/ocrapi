@@ -106,3 +106,64 @@ def test_inject_text_layer_chunks_maps_page_offsets(tmp_path: Path):
     with fitz.open(output_pdf) as pdf:
         assert "chunk-one" in pdf[0].get_text("text")
         assert "chunk-two" in pdf[1].get_text("text")
+
+
+def test_inject_text_layer_legacy_path_still_works(tmp_path: Path):
+    input_pdf = tmp_path / "input.pdf"
+    output_pdf = tmp_path / "output.pdf"
+
+    with fitz.open() as pdf:
+        page = pdf.new_page(width=612, height=792)
+        page.insert_text((72, 72), "visible anchor")
+        pdf.save(input_pdf)
+
+    processed_pages = inject_text_layer(
+        input_pdf,
+        [_make_document()],
+        output_pdf,
+        save_incremental=False,
+        use_textwriter=False,
+    )
+
+    assert processed_pages == 1
+    assert output_pdf.exists()
+
+    with fitz.open(output_pdf) as pdf:
+        text = pdf[0].get_text("text")
+
+    assert "Hello" in text
+    assert "world" in text
+
+
+def test_inject_text_layer_fast_path_multi_page(tmp_path: Path):
+    input_pdf = tmp_path / "input.pdf"
+    output_pdf = tmp_path / "output.pdf"
+
+    with fitz.open() as pdf:
+        for index in range(3):
+            page = pdf.new_page(width=612, height=792)
+            page.insert_text((72, 72), f"visible-{index + 1}")
+        pdf.save(input_pdf)
+
+    chunk_results = [
+        (0, _make_document_for_page(1, "page-one")),
+        (1, _make_document_for_page(1, "page-two")),
+        (2, _make_document_for_page(1, "page-three")),
+    ]
+
+    processed_pages = inject_text_layer_chunks(
+        input_pdf,
+        chunk_results,
+        output_pdf,
+        save_incremental=True,
+        use_textwriter=True,
+    )
+
+    assert processed_pages == 3
+    assert output_pdf.exists()
+
+    with fitz.open(output_pdf) as pdf:
+        assert len(pdf) == 3
+        assert "page-one" in pdf[0].get_text("text")
+        assert "page-two" in pdf[1].get_text("text")
+        assert "page-three" in pdf[2].get_text("text")

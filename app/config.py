@@ -34,6 +34,9 @@ class Settings(BaseSettings):
     online_chunk_max_bytes: int = 18 * 1024 * 1024
     online_max_concurrency: int = 8
 
+    pdf_save_incremental: bool = True
+    pdf_use_textwriter: bool = True
+
     jobs_dir: str = "jobs"
     ocr_worker_concurrency: int = 4
 
