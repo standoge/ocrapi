@@ -30,6 +30,10 @@ class JobStatusResponse(BaseModel):
         default=None,
         description="Google Drive view link when uploaded",
     )
+    driveUploadError: str | None = Field(
+        default=None,
+        description="Drive upload error when OCR succeeded but upload failed",
+    )
 
 
 class DriveUploadResponse(BaseModel):

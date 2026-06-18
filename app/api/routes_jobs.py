@@ -33,6 +33,7 @@ def _job_status_response(job_id: str, meta: dict, request: Request) -> JobStatus
         resultUrl=result_url,
         driveFileId=meta.get("driveFileId"),
         driveWebViewLink=meta.get("driveWebViewLink"),
+        driveUploadError=meta.get("driveUploadError"),
     )
 
 

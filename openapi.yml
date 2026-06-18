@@ -316,6 +316,10 @@ components:
           type: string
           format: uri
           nullable: true
+        driveUploadError:
+          type: string
+          nullable: true
+          description: Present when OCR succeeded but optional Drive upload failed
     ProblemDetails:
       type: object
       description: RFC 7807 Problem Details
