@@ -1,6 +1,6 @@
 # DocAI OCR API
 
-REST API that accepts a PDF and returns a searchable PDF using **GCP Document AI** as the OCR engine via a custom **ocrmypdf** plugin.
+REST API that accepts a PDF and returns a searchable PDF using **GCP Document AI** for OCR and **PyMuPDF** for invisible text-layer injection.
 
 ## Features
 
@@ -15,7 +15,7 @@ REST API that accepts a PDF and returns a searchable PDF using **GCP Document AI
 
 ### Overview
 
-The API is a **FastAPI** application that wraps **ocrmypdf** for PDF handling (rasterization, page assembly, output formatting) and delegates all OCR to **GCP Document AI** through a custom ocrmypdf plugin (`ocr_documentai_plugin`). Tesseract is explicitly disabled; Ghostscript and qpdf handle PDF preprocessing only.
+The API is a **FastAPI** application that sends PDFs (or page chunks) to **GCP Document AI** via `processDocument` (online), then injects an invisible text layer with **PyMuPDF**. There is no local OCR engine (no Tesseract, Ghostscript, or ocrmypdf).
 
 ```mermaid
 flowchart TB
@@ -28,14 +28,16 @@ flowchart TB
     end
 
     subgraph Plugin["ocr_documentai_plugin"]
-        Engine["DocumentAIOcrEngine"]
-        ClientDAI["DocumentAIClient"]
-        HOCR["document_to_hocr"]
+        DocAIClient["DocumentAIClient"]
+        Split["pdf_split"]
+        TextLayer["pdf_textlayer"]
+        GCS["gcs_client"]
     end
 
     subgraph External["External services"]
         DocAI["GCP Document AI<br/>Document OCR processor"]
         Drive["Google Drive API<br/>Shared Drive"]
+        Bucket["GCS bucket<br/>(batch scratch, unused by jobs)"]
     end
 
     FS[("JOBS_DIR<br/>filesystem job store")]
@@ -47,10 +49,12 @@ flowchart TB
     JobMgr --> FS
     JobMgr --> Pipeline
     JobMgr --> Drive
-    Pipeline -->|"ocrmypdf.ocr(ocr_engine=documentai)"| Engine
-    Engine --> ClientDAI
-    ClientDAI --> DocAI
-    Engine --> HOCR
+    Pipeline --> DocAIClient
+    Pipeline --> Split
+    Pipeline --> TextLayer
+    DocAIClient --> DocAI
+    DocAIClient -.->|batch path| GCS
+    GCS -.-> Bucket
     Pipeline --> Temp
     Routes --> Drive
 ```
@@ -60,15 +64,14 @@ flowchart TB
 | Path | Role |
 |------|------|
 | `app/main.py` | Application entrypoint, lifespan hooks, OpenAPI/Swagger routes, global error handling |
-| `app/config.py` | Pydantic settings loaded from `.env` (GCP, Drive, limits, concurrency) |
+| `app/config.py` | Pydantic settings loaded from `.env` (GCP, Drive, GCS, limits, concurrency) |
 | `app/api/` | HTTP route handlers (`routes_ocr`, `routes_drive`, `routes_jobs`) and upload validation |
-| `app/services/ocr_pipeline.py` | Validates PDFs and invokes ocrmypdf (sync or file-based for jobs) |
+| `app/services/ocr_pipeline.py` | Validates PDFs, calls Document AI, injects text layer (sync or file-based for jobs) |
 | `app/services/job_manager.py` | Async job queue, worker pool, on-disk job metadata and file I/O |
 | `app/services/drive_client.py` | Uploads searchable PDFs to a Shared Drive folder via service account |
-| `ocr_documentai_plugin/` | ocrmypdf plugin: Document AI OCR engine, hOCR conversion, progress logging hook |
+| `ocr_documentai_plugin/` | Document AI client, PDF splitting, PyMuPDF text-layer injection, GCS helpers |
 | `openapi.yml` | Design-first API contract; served at `/openapi.yml` and `/openapi.json`, drives `/docs` |
-
-The plugin is registered in `pyproject.toml` as an ocrmypdf entry point (`documentai = "ocr_documentai_plugin"`), so `ocrmypdf.ocr(..., ocr_engine="documentai")` loads it automatically after `pip install`.
+| `deploy/gcp/` | Scripts and systemd units to run on a single GCE VM with Docker |
 
 ### Request paths
 
@@ -76,17 +79,18 @@ There are two ways to run OCR: **synchronous** (hold the HTTP connection) and **
 
 **Sync** (`POST /v1/ocr`, `POST /v1/ocr/drive`):
 
-1. Upload is validated (PDF content type, size ≤ `MAX_UPLOAD_BYTES`, page count ≤ `SYNC_MAX_PAGES`).
+1. Upload is validated (PDF content type, size ≤ `MAX_UPLOAD_BYTES`).
 2. PDF bytes are written to a temporary directory.
-3. `ocr_pipeline.run_ocr_pipeline()` runs ocrmypdf in a thread pool (`asyncio.to_thread`).
-4. For `/v1/ocr/drive`, the searchable PDF is uploaded to Drive (`folder_id` form field or `DRIVE_SHARED_FOLDER_ID` default).
-5. Response is PDF bytes or Drive file metadata.
+3. `ocr_pipeline.run_ocr_pipeline()` sends the whole PDF to Document AI online `processDocument` (page count ≤ `SYNC_MAX_PAGES`) in a thread pool (`asyncio.to_thread`).
+4. PyMuPDF overlays invisible text from the Document AI layout onto the original pages.
+5. For `/v1/ocr/drive`, the searchable PDF is uploaded to Drive (`folder_id` form field or `DRIVE_SHARED_FOLDER_ID` default).
+6. Response is PDF bytes or Drive file metadata.
 
 **Async** (`POST /v1/jobs` → poll → download):
 
 1. A job folder is created under `JOBS_DIR/{jobId}/` with `meta.json`, and the upload is streamed to `input.pdf` (no full-file memory buffer).
 2. The job is enqueued; the API returns `202` with a `statusUrl` immediately.
-3. A background worker picks up the job, sets status to `running`, splits the PDF into byte-aware chunks, and runs concurrent online `processDocument` calls (`ONLINE_MAX_CONCURRENCY`) via `run_ocr_pipeline_file()`.
+3. A background worker picks up the job, sets status to `running`, splits the PDF into byte-aware chunks, and runs concurrent online `processDocument` calls (`ONLINE_MAX_CONCURRENCY`) per chunk.
 4. PyMuPDF overlays invisible text from all chunk results, writes `output.pdf`, and status becomes `succeeded`. Optional Drive upload runs after OCR; failure there is recorded in `driveUploadError` without changing job status to `failed`.
 5. Client polls `GET /v1/jobs/{jobId}` and downloads via `GET /v1/jobs/{jobId}/result` when ready.
 
@@ -95,7 +99,7 @@ sequenceDiagram
     participant C as Client
     participant API as FastAPI
     participant JM as JobManager
-    participant OCR as ocrmypdf + plugin
+    participant OCR as ocr_pipeline
     participant DAI as Document AI
     participant D as Drive
 
@@ -110,11 +114,12 @@ sequenceDiagram
 
     Note over JM,OCR: Worker (asyncio task pool)
     JM->>OCR: run_ocr_pipeline_file(input.pdf)
-    loop Each page
-        OCR->>DAI: processOnline (page image)
+    OCR->>OCR: split_pdf into chunks
+    loop Each chunk (concurrent)
+        OCR->>DAI: processDocument (chunk PDF)
         DAI-->>OCR: Document (text + layout)
-        OCR->>OCR: hOCR → invisible text layer
     end
+    OCR->>OCR: PyMuPDF inject_text_layer_chunks
     OCR-->>JM: output.pdf
 
     opt folder_id set
@@ -128,19 +133,17 @@ sequenceDiagram
 
 ### OCR pipeline (how searchable PDFs are built)
 
-ocrmypdf owns the end-to-end PDF workflow. The custom plugin replaces only the OCR engine step:
+1. **Validate** — page count and file size are checked against configured limits.
+2. **Split (async only)** — `split_pdf` divides the PDF into chunks that fit online `processDocument` limits (`ONLINE_CHUNK_PAGES`, `ONLINE_CHUNK_MAX_BYTES`).
+3. **OCR** — `DocumentAIClient.process_pdf_online` sends each PDF (whole file for sync, per chunk for async) to Document AI with retries on transient errors.
+4. **Text layer** — `inject_text_layer` / `inject_text_layer_chunks` maps Document AI tokens onto the original PDF pages with PyMuPDF (`PDF_USE_TEXTWRITER`, `PDF_SAVE_INCREMENTAL` tune assembly performance).
+5. **Output** — searchable PDF is written to disk or returned as bytes.
 
-1. **Rasterize** — ocrmypdf uses Ghostscript to render each PDF page to an image (300 DPI by default).
-2. **OCR per page** — `DocumentAIOcrEngine` sends each page image to Document AI via `process_document` (online, with retries on transient API errors).
-3. **Layout → hOCR** — `document_to_hocr` converts Document AI tokens/lines into hOCR XML and a sidecar text file.
-4. **Text layer** — ocrmypdf renders invisible text from hOCR onto the page (`Fpdf2PdfRenderer`), producing a searchable PDF while preserving the original appearance.
-5. **Output** — Final PDF is written with `output_type` from `DEFAULT_OUTPUT_TYPE` (`pdf` or `pdfa`).
-
-The plugin blocks ocrmypdf's built-in Tesseract engine at initialization so Document AI is the sole OCR backend. Page-level progress is logged through a custom progress bar class tied to job/filename context.
+A GCS-backed **batch** code path exists (`batch_process_from_gcs`) for future use but is not used by the current async job pipeline.
 
 ### Job system
 
-`JobManager` starts with the FastAPI lifespan and runs a bounded pool of asyncio worker tasks (`OCR_WORKER_CONCURRENCY`). Each worker processes one PDF at a time; within a PDF, ocrmypdf parallelizes pages (`OCRMYPDF_JOBS`).
+`JobManager` starts with the FastAPI lifespan and runs a bounded pool of asyncio worker tasks (`OCR_WORKER_CONCURRENCY`). Each worker processes one PDF at a time; within a PDF, chunk OCR runs in a `ThreadPoolExecutor` bounded by `ONLINE_MAX_CONCURRENCY`.
 
 Job state is persisted as JSON on disk:
 
@@ -151,11 +154,11 @@ jobs/{jobId}/
   output.pdf     # searchable result (after success)
 ```
 
-Statuses: `queued` → `running` → `succeeded` | `failed`. On restart, jobs left in `running` are re-queued as `queued`. Job folders are not auto-deleted.
+Statuses: `queued` → `running` → `succeeded` | `failed`. On restart, jobs left in `running` are re-queued as `queued`. Job folders are not auto-deleted in the app; use the deploy cleanup timer or a manual sweep.
 
 ### Google Drive integration
 
-Drive uploads use the same service account JSON as Document AI (`GOOGLE_APPLICATION_CREDENTIALS`). The client uses the `drive.file` scope and `supportsAllDrives=True` for Shared Drive folders. Sync endpoints upload immediately after OCR; async jobs upload optionally when `folder_id` is provided on job creation.
+Drive uploads use the same service account as Document AI (JSON key locally via `GOOGLE_APPLICATION_CREDENTIALS`, or the attached VM service account via Application Default Credentials in production). The client uses the `drive.file` scope and `supportsAllDrives=True` for Shared Drive folders. Sync endpoints upload immediately after OCR; async jobs upload optionally when `folder_id` is provided on job creation.
 
 ### API contract and errors
 
@@ -185,17 +188,17 @@ per-page rasterization scratch.
    - Enable Document AI API
    - Create a **Document OCR** processor and note `processor_id` and `location`
    - Create a service account with `roles/documentai.apiUser`
+   - Create a GCS bucket (required by config; used only if batch OCR is enabled)
 
 2. **Google Drive**
    - Create or use a **Shared Drive** folder
    - Share the folder with the service account email (Content Manager)
    - Enable Google Drive API on the project
 
-3. **System dependencies** (for ocrmypdf PDF processing — **not** for OCR)
-   - **Ghostscript** and **qpdf** are required to rasterize PDF pages and produce PDF/A output
-   - **Tesseract is NOT used**; OCR is performed exclusively by GCP Document AI
-   - On Windows (Scoop): `scoop install ghostscript qpdf`
-   - Docker image includes all dependencies (see Dockerfile)
+3. **Runtime**
+   - Python 3.11+
+   - No system OCR or PDF rasterization tools required (PyMuPDF and Document AI handle the pipeline)
+   - Docker image is Python slim only (see `Dockerfile`)
 
 ## Setup
 
@@ -220,6 +223,10 @@ Open Swagger UI at http://localhost:8000/docs
 docker build -t ocrapi .
 docker run --env-file .env -p 8000:8000 ocrapi
 ```
+
+## Deploy to GCP
+
+See [`deploy/gcp/README.md`](deploy/gcp/README.md) for provisioning a single GCE VM with Docker, a data disk for `JOBS_DIR`, Artifact Registry, and systemd units.
 
 ## API usage
 
@@ -266,12 +273,22 @@ curl -X POST http://localhost:8000/v1/ocr/drive \
 
 | Variable | Default | Description |
 |----------|---------|-------------|
+| `GCP_PROJECT_ID` | — | GCP project containing the Document AI processor |
+| `GCP_LOCATION` | `us` | Document AI processor location |
+| `GCP_PROCESSOR_ID` | — | Document OCR processor ID |
+| `GOOGLE_APPLICATION_CREDENTIALS` | — | Path to service account JSON (optional on GCE; uses VM SA via ADC) |
+| `GCS_BUCKET` | — | GCS bucket for batch OCR scratch (unused by current async jobs) |
+| `BATCH_TIMEOUT_SECONDS` | `1800` | Timeout for batch OCR LRO polling |
+| `BATCH_POLL_INTERVAL_SECONDS` | `10` | Poll interval for batch OCR |
+| `DRIVE_SHARED_FOLDER_ID` | — | Default Shared Drive folder for `/v1/ocr/drive` |
 | `MAX_UPLOAD_BYTES` | `629145600` (600 MB) | Maximum upload size for job and sync endpoints |
 | `MAX_PDF_PAGES` | `2000` | Maximum pages for async job processing |
 | `SYNC_MAX_PAGES` | `15` | Maximum pages for sync `/v1/ocr` and `/v1/ocr/drive` |
 | `ONLINE_CHUNK_PAGES` | `15` | Maximum pages per online OCR chunk (async jobs) |
 | `ONLINE_CHUNK_MAX_BYTES` | `18874368` (18 MB) | Maximum bytes per online OCR chunk |
 | `ONLINE_MAX_CONCURRENCY` | `8` | Concurrent online `processDocument` calls per async job |
+| `PDF_SAVE_INCREMENTAL` | `true` | PyMuPDF incremental save when injecting text layer |
+| `PDF_USE_TEXTWRITER` | `true` | PyMuPDF TextWriter for faster token injection |
 | `JOBS_DIR` | `jobs` | Directory for job input/output files |
 | `OCR_WORKER_CONCURRENCY` | `4` | Number of PDFs processed in parallel |
 
@@ -286,7 +303,8 @@ AI online pages/min quota before increasing both knobs. See `deploy/gcp/QUOTA.md
 Async jobs store `input.pdf` and `output.pdf` under `JOBS_DIR`. Plan retention
 for large uploads (e.g. 500 MB × concurrent jobs).
 
-Job folders are not automatically deleted; plan a retention sweep for old jobs.
+Job folders are not automatically deleted; plan a retention sweep for old jobs
+or use the systemd timer in `deploy/gcp/`.
 
 ## Tests
 
