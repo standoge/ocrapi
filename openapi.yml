@@ -29,8 +29,9 @@ paths:
       operationId: ocrPdf
       summary: OCR a PDF and return searchable PDF
       description: |
-        Accepts a PDF file via multipart upload, runs OCR using GCP Document AI,
-        and returns the same PDF with an embedded searchable text layer via PyMuPDF.
+        Accepts a PDF file via multipart upload, runs OCR using GCP Document AI
+        online processDocument, and returns the same PDF with an embedded searchable
+        text layer via PyMuPDF. Limited to small documents (up to SYNC_MAX_PAGES pages).
       tags:
         - OCR
       requestBody:
@@ -48,7 +49,7 @@ paths:
                   description: PDF file to OCR
       responses:
         "200":
-          description: Searchable PDF (PDF/A)
+          description: Searchable PDF with embedded invisible text layer
           content:
             application/pdf:
               schema:

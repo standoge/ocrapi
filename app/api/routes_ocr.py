@@ -23,7 +23,7 @@ router = APIRouter(prefix="/v1", tags=["OCR"])
     responses={
         200: {
             "content": {"application/pdf": {}},
-            "description": "Searchable PDF (PDF/A)",
+            "description": "Searchable PDF with embedded invisible text layer",
         }
     },
 )
