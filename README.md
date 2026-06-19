@@ -7,6 +7,7 @@ REST API that accepts a PDF and returns a searchable PDF using **GCP Document AI
 - `POST /v1/jobs` — submit a PDF for async OCR (recommended for large documents)
 - `GET /v1/jobs/{jobId}` — poll job status
 - `GET /v1/jobs/{jobId}/result` — download searchable PDF when ready
+- `POST /v1/jobs/{jobId}/drive` — upload a finished job's result to Google Drive
 - `POST /v1/ocr` — upload a PDF, receive a searchable PDF synchronously (small docs only)
 - `POST /v1/ocr/drive` — OCR a PDF and upload the result to a Google Drive Shared Drive
 - Design-first OpenAPI contract at `/openapi.yml`
@@ -255,6 +256,18 @@ curl -X POST http://localhost:8000/v1/jobs \
   -F "folder_id=YOUR_SHARED_DRIVE_FOLDER_ID"
 ```
 
+Or upload after the job succeeds (omit `folderId` to use `DRIVE_SHARED_FOLDER_ID`):
+
+```bash
+curl -X POST http://localhost:8000/v1/jobs/JOB_ID/drive \
+  -H "Content-Type: application/json" \
+  -d '{"folderId": "YOUR_SHARED_DRIVE_FOLDER_ID", "filename": "searchable-document.pdf"}'
+
+curl -X POST http://localhost:8000/v1/jobs/JOB_ID/drive \
+  -H "Content-Type: application/json" \
+  -d '{}'
+```
+
 ### Sync OCR (small documents)
 
 For quick tests or small PDFs (up to `SYNC_MAX_PAGES`, default 15):
@@ -266,7 +279,8 @@ curl -X POST http://localhost:8000/v1/ocr \
 
 curl -X POST http://localhost:8000/v1/ocr/drive \
   -F "file=@document.pdf" \
-  -F "filename=searchable-document.pdf"
+  -F "filename=searchable-document.pdf" \
+  -F "folder_id=YOUR_SHARED_DRIVE_FOLDER_ID"
 ```
 
 ## Configuration
@@ -280,7 +294,7 @@ curl -X POST http://localhost:8000/v1/ocr/drive \
 | `GCS_BUCKET` | — | GCS bucket for batch OCR scratch (unused by current async jobs) |
 | `BATCH_TIMEOUT_SECONDS` | `1800` | Timeout for batch OCR LRO polling |
 | `BATCH_POLL_INTERVAL_SECONDS` | `10` | Poll interval for batch OCR |
-| `DRIVE_SHARED_FOLDER_ID` | — | Default Shared Drive folder for `/v1/ocr/drive` |
+| `DRIVE_SHARED_FOLDER_ID` | — | Optional default Shared Drive folder for `/v1/ocr/drive` and `/v1/jobs/{jobId}/drive` when folder ID is omitted |
 | `MAX_UPLOAD_BYTES` | `629145600` (600 MB) | Maximum upload size for job and sync endpoints |
 | `MAX_PDF_PAGES` | `2000` | Maximum pages for async job processing |
 | `SYNC_MAX_PAGES` | `15` | Maximum pages for sync `/v1/ocr` and `/v1/ocr/drive` |
