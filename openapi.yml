@@ -75,8 +75,9 @@ paths:
       operationId: ocrPdfToDrive
       summary: OCR a PDF and upload to Google Drive
       description: |
-        Accepts a PDF file, runs OCR, uploads the searchable PDF to a configured
-        Google Drive Shared Drive folder, and returns file metadata.
+        Accepts a PDF file, runs OCR, uploads the searchable PDF to a Google Drive
+        Shared Drive folder, and returns file metadata. Provide `folder_id` in the
+        request, or configure `DRIVE_SHARED_FOLDER_ID` as a server default.
       tags:
         - OCR
       requestBody:
@@ -216,6 +217,44 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "404":
           $ref: "#/components/responses/NotFound"
+  /v1/jobs/{jobId}/drive:
+    post:
+      operationId: uploadOcrJobResultToDrive
+      summary: Upload a finished job's result to Google Drive
+      description: |
+        Uploads the searchable PDF from a succeeded OCR job to the specified Google
+        Drive folder. Provide `folderId` in the request, or configure
+        `DRIVE_SHARED_FOLDER_ID` as a server default. Use this to upload results
+        for jobs created without `folder_id`, or to re-upload to a different folder.
+      tags:
+        - Jobs
+      parameters:
+        - name: jobId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: Job identifier returned by POST /v1/jobs
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/JobDriveUploadRequest"
+      responses:
+        "200":
+          description: Drive upload metadata
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DriveUploadResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "502":
+          $ref: "#/components/responses/BadGateway"
 components:
   schemas:
     HealthResponse:
@@ -248,6 +287,17 @@ components:
           format: uri
           description: Link to view the file in Google Drive
           example: https://drive.google.com/file/d/1abc/view
+    JobDriveUploadRequest:
+      type: object
+      properties:
+        folderId:
+          type: string
+          description: Optional Shared Drive folder ID (overrides server default)
+          example: 1abcDEFghijklmnop
+        filename:
+          type: string
+          description: Optional output filename in Drive
+          example: searchable-document.pdf
     JobCreatedResponse:
       type: object
       required:
