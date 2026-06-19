@@ -13,6 +13,7 @@ from typing import Any
 
 from app.config import Settings
 from app.exceptions import NotFoundError, ValidationError
+from app.schemas import DriveUploadResponse
 from app.services import ocr_pipeline
 from app.services.drive_client import get_drive_client
 
@@ -247,6 +248,35 @@ class JobManager:
             meta = self._read_meta(job_id)
             meta["driveUploadError"] = str(exc)
             self._write_meta(job_id, meta)
+
+    async def upload_result_to_drive(
+        self,
+        job_id: str,
+        folder_id: str,
+        *,
+        filename: str | None = None,
+    ) -> DriveUploadResponse:
+        output_path = self.get_output_path(job_id)
+        meta = self._read_meta(job_id)
+        output_name = filename or meta.get("outputFilename")
+        if not output_name:
+            stem = Path(meta["originalFilename"]).stem
+            output_name = f"{stem}_ocr.pdf"
+
+        drive_client = get_drive_client(self._settings)
+        result = await asyncio.to_thread(
+            drive_client.upload_pdf,
+            output_path.read_bytes(),
+            output_name,
+            folder_id,
+        )
+        meta = self._read_meta(job_id)
+        meta["driveFileId"] = result.fileId
+        meta["driveWebViewLink"] = result.webViewLink
+        meta["driveUploadError"] = None
+        self._write_meta(job_id, meta)
+        logger.info("Job %s uploaded to Drive file %s", job_id, result.fileId)
+        return result
 
 
 def get_job_manager(settings: Settings) -> JobManager:

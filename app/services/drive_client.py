@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import io
-import os
 
+import google.auth
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
@@ -20,16 +20,21 @@ _drive_client: DriveClient | None = None
 
 class DriveClient:
     def __init__(self, settings: Settings) -> None:
-        credentials_path = settings.google_application_credentials
-        if not credentials_path or not os.path.exists(credentials_path):
-            raise ConfigurationError(
-                "GOOGLE_APPLICATION_CREDENTIALS must point to a valid service account JSON file"
+        credentials_path = settings.credentials_path
+        if credentials_path and credentials_path.exists():
+            credentials = service_account.Credentials.from_service_account_file(
+                str(credentials_path),
+                scopes=SCOPES,
             )
-
-        credentials = service_account.Credentials.from_service_account_file(
-            credentials_path,
-            scopes=SCOPES,
-        )
+        else:
+            try:
+                credentials, _ = google.auth.default(scopes=SCOPES)
+            except google.auth.exceptions.DefaultCredentialsError as exc:
+                raise ConfigurationError(
+                    "No Google credentials found: set GOOGLE_APPLICATION_CREDENTIALS "
+                    "to a service account JSON file, or run on a host with an attached "
+                    "service account (Application Default Credentials)."
+                ) from exc
         self._service = build("drive", "v3", credentials=credentials, cache_discovery=False)
 
     def upload_pdf(

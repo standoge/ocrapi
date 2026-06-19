@@ -20,7 +20,7 @@ class Settings(BaseSettings):
     gcp_processor_id: str
     google_application_credentials: str | None = None
 
-    drive_shared_folder_id: str
+    drive_shared_folder_id: str | None = None
 
     gcs_bucket: str
     batch_timeout_seconds: int = 1800

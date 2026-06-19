@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import logging
 
-from fastapi import APIRouter, File, Form, Request, UploadFile
+from fastapi import APIRouter, Depends, File, Form, Request, UploadFile
 from fastapi.responses import FileResponse
 
 from app.api.deps import ocr_output_filename, save_upload_to_path
 from app.config import Settings, get_settings
-from app.schemas import JobCreatedResponse, JobStatusResponse
+from app.exceptions import ValidationError
+from app.schemas import DriveUploadResponse, JobCreatedResponse, JobDriveUploadRequest, JobStatusResponse
 from app.services.job_manager import get_job_manager
 
 logger = logging.getLogger(__name__)
@@ -104,4 +105,27 @@ async def get_job_result(
         path=output_path,
         media_type="application/pdf",
         filename=download_name,
+    )
+
+
+@router.post(
+    "/jobs/{job_id}/drive",
+    summary="Upload a finished job's result to Google Drive",
+    response_model=DriveUploadResponse,
+    operation_id="upload_job_result_to_drive",
+)
+async def upload_job_to_drive(
+    job_id: str,
+    payload: JobDriveUploadRequest,
+    settings: Settings = Depends(get_settings),
+) -> DriveUploadResponse:
+    target_folder = payload.folderId or settings.drive_shared_folder_id
+    if not target_folder:
+        raise ValidationError("folderId is required when DRIVE_SHARED_FOLDER_ID is not configured")
+
+    job_manager = get_job_manager(settings)
+    return await job_manager.upload_result_to_drive(
+        job_id,
+        target_folder,
+        filename=payload.filename,
     )

@@ -42,6 +42,14 @@ class DriveUploadResponse(BaseModel):
     webViewLink: str = Field(..., description="Link to view the file in Google Drive")
 
 
+class JobDriveUploadRequest(BaseModel):
+    folderId: str | None = Field(
+        default=None,
+        description="Google Drive folder ID to upload the job result to (overrides server default)",
+    )
+    filename: str | None = Field(default=None, description="Optional output filename in Drive")
+
+
 class ProblemDetails(BaseModel):
     type: str = "about:blank"
     title: str
