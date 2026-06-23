@@ -79,6 +79,17 @@ class DriveClient:
             "mimeType": "application/pdf",
         }
 
+        # #region agent log (debug b90bd8 - H-1 concurrency check)
+        global _dbg_active_uploads
+        with _dbg_counter_lock:
+            _dbg_active_uploads += 1
+            _dbg_active = _dbg_active_uploads
+        _dbg_logger.info(
+            "[debug b90bd8] Drive upload START thread=%s active_uploads=%d size=%d file=%s",
+            threading.current_thread().name, _dbg_active, len(pdf_bytes), filename,
+        )
+        # #endregion
+
         try:
             created = (
                 self._service.files()
