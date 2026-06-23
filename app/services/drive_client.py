@@ -2,17 +2,13 @@
 
 from __future__ import annotations
 
-import io
-import threading
 import time
 from typing import Any
 
 import google.auth
-import google_auth_httplib2
-import httplib2
+import requests
+from google.auth.transport.requests import AuthorizedSession
 from google.oauth2 import service_account
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseUpload
 
 from app.config import Settings
 from app.exceptions import ConfigurationError, UpstreamServiceError
@@ -20,8 +16,11 @@ from app.schemas import DriveUploadResponse
 
 SCOPES = ["https://www.googleapis.com/auth/drive.file"]
 
-_HTTP_TIMEOUT_SECONDS = 300
-_UPLOAD_EXECUTE_RETRIES = 5
+_DRIVE_RESUMABLE_INIT_URL = (
+    "https://www.googleapis.com/upload/drive/v3/files"
+    "?uploadType=resumable&supportsAllDrives=true&fields=id,name,webViewLink"
+)
+_REQUEST_TIMEOUT = (30, 300)
 _MAX_UPLOAD_ATTEMPTS = 3
 _RETRY_BACKOFF_SECONDS = (1, 2, 4)
 
@@ -37,27 +36,32 @@ _RETRYABLE_ERROR_MARKERS = (
     "504",
     "500",
     "internal error",
+    "429",
+    "too many requests",
 )
 
 _drive_client: DriveClient | None = None
 
 
+class DriveUploadError(Exception):
+    """Drive upload failure; retryable=True triggers upload_pdf retry loop."""
+
+    def __init__(self, message: str, *, retryable: bool = False) -> None:
+        super().__init__(message)
+        self.retryable = retryable
+
+
 def _is_retryable_upload_error(exc: Exception) -> bool:
+    if isinstance(exc, DriveUploadError):
+        return exc.retryable
+    if isinstance(exc, requests.exceptions.RequestException):
+        return True
     message = str(exc).lower()
     return any(marker in message for marker in _RETRYABLE_ERROR_MARKERS)
 
 
-def _lock_credentials_refresh(credentials: Any) -> Any:
-    """Wrap credentials.refresh so parallel uploads do not race token refresh."""
-    refresh_lock = threading.Lock()
-    original_refresh = credentials.refresh
-
-    def locked_refresh(request: Any) -> None:
-        with refresh_lock:
-            return original_refresh(request)
-
-    credentials.refresh = locked_refresh  # type: ignore[method-assign]
-    return credentials
+def _http_status_retryable(status_code: int) -> bool:
+    return status_code >= 500 or status_code == 429
 
 
 class DriveClient:
@@ -77,41 +81,88 @@ class DriveClient:
                     "to a service account JSON file, or run on a host with an attached "
                     "service account (Application Default Credentials)."
                 ) from exc
-        self._credentials = _lock_credentials_refresh(credentials)
+        self._credentials = credentials
 
-    def _build_service(self) -> Any:
-        """Fresh httplib2 transport and Drive API client for one upload session."""
-        http = httplib2.Http(timeout=_HTTP_TIMEOUT_SECONDS)
-        authed_http = google_auth_httplib2.AuthorizedHttp(self._credentials, http=http)
-        return build("drive", "v3", http=authed_http, cache_discovery=False)
+    def _new_session(self) -> AuthorizedSession:
+        """Fresh authorized requests session for one upload (thread-safe isolation)."""
+        return AuthorizedSession(self._credentials)
 
     def _execute_upload(
         self,
+        session: AuthorizedSession,
         pdf_bytes: bytes,
         filename: str,
         folder_id: str,
     ) -> dict[str, Any]:
-        media = MediaIoBaseUpload(
-            io.BytesIO(pdf_bytes),
-            mimetype="application/pdf",
-            resumable=True,
-        )
         metadata = {
             "name": filename,
             "parents": [folder_id],
             "mimeType": "application/pdf",
         }
-        service = self._build_service()
-        return (
-            service.files()
-            .create(
-                body=metadata,
-                media_body=media,
-                fields="id,name,webViewLink",
-                supportsAllDrives=True,
+        init_headers = {
+            "Content-Type": "application/json; charset=UTF-8",
+            "X-Upload-Content-Type": "application/pdf",
+            "X-Upload-Content-Length": str(len(pdf_bytes)),
+        }
+
+        try:
+            init_response = session.post(
+                _DRIVE_RESUMABLE_INIT_URL,
+                json=metadata,
+                headers=init_headers,
+                timeout=_REQUEST_TIMEOUT,
             )
-            .execute(num_retries=_UPLOAD_EXECUTE_RETRIES)
-        )
+        except requests.exceptions.RequestException as exc:
+            raise DriveUploadError(f"Drive resumable init request failed: {exc}", retryable=True) from exc
+
+        if not init_response.ok:
+            body = init_response.text[:500]
+            retryable = _http_status_retryable(init_response.status_code)
+            raise DriveUploadError(
+                f"Drive resumable init failed ({init_response.status_code}): {body}",
+                retryable=retryable,
+            )
+
+        session_uri = init_response.headers.get("Location")
+        if not session_uri:
+            raise DriveUploadError(
+                "Drive resumable init succeeded but response is missing Location header.",
+                retryable=True,
+            )
+
+        upload_headers = {"Content-Type": "application/pdf"}
+        try:
+            upload_response = session.put(
+                session_uri,
+                data=pdf_bytes,
+                headers=upload_headers,
+                timeout=_REQUEST_TIMEOUT,
+            )
+        except requests.exceptions.RequestException as exc:
+            raise DriveUploadError(f"Drive resumable upload failed: {exc}", retryable=True) from exc
+
+        if not upload_response.ok:
+            body = upload_response.text[:500]
+            retryable = _http_status_retryable(upload_response.status_code)
+            raise DriveUploadError(
+                f"Drive resumable upload failed ({upload_response.status_code}): {body}",
+                retryable=retryable,
+            )
+
+        try:
+            created = upload_response.json()
+        except ValueError as exc:
+            raise DriveUploadError(
+                "Drive resumable upload returned non-JSON response.",
+                retryable=True,
+            ) from exc
+
+        if "id" not in created:
+            raise DriveUploadError(
+                "Drive resumable upload response missing file id.",
+                retryable=True,
+            )
+        return created
 
     def upload_pdf(
         self,
@@ -121,8 +172,9 @@ class DriveClient:
     ) -> DriveUploadResponse:
         last_exc: Exception | None = None
         for attempt in range(_MAX_UPLOAD_ATTEMPTS):
+            session = self._new_session()
             try:
-                created = self._execute_upload(pdf_bytes, filename, folder_id)
+                created = self._execute_upload(session, pdf_bytes, filename, folder_id)
                 return DriveUploadResponse(
                     fileId=created["id"],
                     name=created["name"],

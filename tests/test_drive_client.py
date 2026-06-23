@@ -7,9 +7,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from unittest.mock import MagicMock, patch
 
 import pytest
+import requests
 
 from app.exceptions import UpstreamServiceError
-from app.services.drive_client import DriveClient, _is_retryable_upload_error
+from app.services.drive_client import DriveClient, DriveUploadError, _is_retryable_upload_error
 
 
 @pytest.fixture
@@ -39,76 +40,130 @@ def drive_client(tmp_path, monkeypatch):
     return client
 
 
+def _success_responses(session_uri: str = "https://upload.example/session"):
+    init_response = MagicMock()
+    init_response.ok = True
+    init_response.headers = {"Location": session_uri}
+
+    upload_response = MagicMock()
+    upload_response.ok = True
+    upload_response.json.return_value = {
+        "id": "file-1",
+        "name": "doc.pdf",
+        "webViewLink": "https://drive.example/view",
+    }
+    return init_response, upload_response
+
+
 def test_is_retryable_upload_error():
     assert _is_retryable_upload_error(
         Exception("Redirected but the response is missing a Location: header.")
     )
     assert _is_retryable_upload_error(Exception("SSLEOFError: EOF occurred"))
+    assert _is_retryable_upload_error(requests.exceptions.ConnectionError("reset"))
+    assert _is_retryable_upload_error(DriveUploadError("missing Location", retryable=True))
+    assert not _is_retryable_upload_error(DriveUploadError("not found", retryable=False))
     assert not _is_retryable_upload_error(Exception("File not found: abc"))
 
 
 def test_upload_pdf_retries_on_transient_error(drive_client):
-    call_count = 0
+    attempt_count = 0
+    session_count = 0
 
-    def flaky_execute(*args, **kwargs):
-        nonlocal call_count
-        call_count += 1
-        if call_count < 2:
-            raise Exception("Redirected but the response is missing a Location: header.")
-        return {"id": "file-1", "name": "doc.pdf", "webViewLink": "https://drive.example/view"}
+    def new_session():
+        nonlocal session_count
+        session_count += 1
+        session = MagicMock()
 
-    with patch.object(drive_client, "_build_service") as mock_build:
-        mock_service = MagicMock()
-        mock_build.return_value = mock_service
-        mock_service.files.return_value.create.return_value.execute.side_effect = flaky_execute
+        def post(*args, **kwargs):
+            nonlocal attempt_count
+            attempt_count += 1
+            if attempt_count < 2:
+                response = MagicMock()
+                response.ok = True
+                response.headers = {}
+                return response
+            init_response, _ = _success_responses()
+            return init_response
 
+        def put(*args, **kwargs):
+            _, upload_response = _success_responses()
+            return upload_response
+
+        session.post.side_effect = post
+        session.put.side_effect = put
+        return session
+
+    with patch.object(drive_client, "_new_session", side_effect=new_session):
         with patch("app.services.drive_client.time.sleep"):
             result = drive_client.upload_pdf(b"%PDF-1.4", "doc.pdf", "folder-id")
 
     assert result.fileId == "file-1"
-    assert call_count == 2
-    assert mock_build.call_count == 2
+    assert attempt_count == 2
+    assert session_count == 2
 
 
 def test_upload_pdf_raises_after_exhausted_retries(drive_client):
-    with patch.object(drive_client, "_build_service") as mock_build:
-        mock_service = MagicMock()
-        mock_build.return_value = mock_service
-        mock_service.files.return_value.create.return_value.execute.side_effect = Exception(
-            "Redirected but the response is missing a Location: header."
-        )
+    session = MagicMock()
+    init_response = MagicMock()
+    init_response.ok = True
+    init_response.headers = {}
+    session.post.return_value = init_response
 
+    with patch.object(drive_client, "_new_session", return_value=session):
         with patch("app.services.drive_client.time.sleep"):
-            with pytest.raises(UpstreamServiceError, match="missing a Location"):
+            with pytest.raises(UpstreamServiceError, match="missing Location"):
                 drive_client.upload_pdf(b"%PDF-1.4", "doc.pdf", "folder-id")
 
-    assert mock_build.call_count == 3
+    assert session.post.call_count == 3
 
 
-def test_concurrent_uploads_use_isolated_services(drive_client):
-    build_count = 0
-    build_lock = threading.Lock()
-    execute_barrier = threading.Barrier(4)
+def test_upload_pdf_non_retryable_403(drive_client):
+    session = MagicMock()
+    init_response = MagicMock()
+    init_response.ok = False
+    init_response.status_code = 403
+    init_response.text = "Forbidden"
+    session.post.return_value = init_response
 
-    def build_service():
-        nonlocal build_count
-        with build_lock:
-            build_count += 1
-        service = MagicMock()
+    with patch.object(drive_client, "_new_session", return_value=session):
+        with pytest.raises(UpstreamServiceError, match="403"):
+            drive_client.upload_pdf(b"%PDF-1.4", "doc.pdf", "folder-id")
 
-        def execute(*args, **kwargs):
-            execute_barrier.wait(timeout=5)
+    assert session.post.call_count == 1
+
+
+def test_concurrent_uploads_use_isolated_sessions(drive_client):
+    session_count = 0
+    session_lock = threading.Lock()
+    upload_barrier = threading.Barrier(4)
+
+    def new_session():
+        nonlocal session_count
+        with session_lock:
+            session_count += 1
+        session = MagicMock()
+        init_response, upload_response = _success_responses(
+            session_uri=f"https://upload.example/session-{threading.current_thread().name}",
+        )
+        session.post.return_value = init_response
+
+        def put(*args, **kwargs):
+            upload_barrier.wait(timeout=5)
             thread_name = threading.current_thread().name
-            return {
+            response = MagicMock()
+            response.ok = True
+            response.json.return_value = {
                 "id": f"file-{thread_name}",
                 "name": f"{thread_name}.pdf",
                 "webViewLink": f"https://drive.example/{thread_name}",
             }
+            return response
 
-        service.files.return_value.create.return_value.execute.side_effect = execute
-        return service
+        session.put.side_effect = put
+        return session
 
-    with patch.object(drive_client, "_build_service", side_effect=build_service):
+    with patch.object(drive_client, "_new_session", side_effect=new_session):
         with ThreadPoolExecutor(max_workers=4) as pool:
             futures = [
                 pool.submit(
@@ -122,5 +177,5 @@ def test_concurrent_uploads_use_isolated_services(drive_client):
             results = [future.result() for future in as_completed(futures)]
 
     assert len(results) == 4
-    assert build_count == 4
+    assert session_count == 4
     assert len({result.fileId for result in results}) == 4
