@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import io
 import threading
+import time
+from typing import Any
 
 import google.auth
 import google_auth_httplib2
@@ -18,20 +20,44 @@ from app.schemas import DriveUploadResponse
 
 SCOPES = ["https://www.googleapis.com/auth/drive.file"]
 
-# Per-request socket timeout for the (otherwise timeout-less) httplib2 transport.
 _HTTP_TIMEOUT_SECONDS = 300
-# Number of automatic retries for transient (5xx / socket / SSL) upload errors.
-_UPLOAD_NUM_RETRIES = 5
+_UPLOAD_EXECUTE_RETRIES = 5
+_MAX_UPLOAD_ATTEMPTS = 3
+_RETRY_BACKOFF_SECONDS = (1, 2, 4)
+
+_RETRYABLE_ERROR_MARKERS = (
+    "redirected but the response is missing a location",
+    "ssleoferror",
+    "ssl",
+    "connection reset",
+    "connection aborted",
+    "broken pipe",
+    "502",
+    "503",
+    "504",
+    "500",
+    "internal error",
+)
 
 _drive_client: DriveClient | None = None
 
-# #region agent log (debug b90bd8 - upload concurrency instrumentation)
-import logging as _logging
 
-_dbg_logger = _logging.getLogger("app.services.drive_client")
-_dbg_counter_lock = threading.Lock()
-_dbg_active_uploads = 0
-# #endregion
+def _is_retryable_upload_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return any(marker in message for marker in _RETRYABLE_ERROR_MARKERS)
+
+
+def _lock_credentials_refresh(credentials: Any) -> Any:
+    """Wrap credentials.refresh so parallel uploads do not race token refresh."""
+    refresh_lock = threading.Lock()
+    original_refresh = credentials.refresh
+
+    def locked_refresh(request: Any) -> None:
+        with refresh_lock:
+            return original_refresh(request)
+
+    credentials.refresh = locked_refresh  # type: ignore[method-assign]
+    return credentials
 
 
 class DriveClient:
@@ -51,19 +77,40 @@ class DriveClient:
                     "to a service account JSON file, or run on a host with an attached "
                     "service account (Application Default Credentials)."
                 ) from exc
-        self._credentials = credentials
-        self._service = build("drive", "v3", credentials=credentials, cache_discovery=False)
+        self._credentials = _lock_credentials_refresh(credentials)
 
-    def _build_http(self) -> google_auth_httplib2.AuthorizedHttp:
-        """A fresh authorized transport per request.
+    def _build_service(self) -> Any:
+        """Fresh httplib2 transport and Drive API client for one upload session."""
+        http = httplib2.Http(timeout=_HTTP_TIMEOUT_SECONDS)
+        authed_http = google_auth_httplib2.AuthorizedHttp(self._credentials, http=http)
+        return build("drive", "v3", http=authed_http, cache_discovery=False)
 
-        httplib2.Http is not thread-safe and reuses cached keep-alive
-        connections; sharing one across the job worker threads corrupts the
-        SSL socket (SSLEOFError / SSL internal error). Each upload gets its own.
-        """
-        return google_auth_httplib2.AuthorizedHttp(
-            self._credentials,
-            http=httplib2.Http(timeout=_HTTP_TIMEOUT_SECONDS),
+    def _execute_upload(
+        self,
+        pdf_bytes: bytes,
+        filename: str,
+        folder_id: str,
+    ) -> dict[str, Any]:
+        media = MediaIoBaseUpload(
+            io.BytesIO(pdf_bytes),
+            mimetype="application/pdf",
+            resumable=True,
+        )
+        metadata = {
+            "name": filename,
+            "parents": [folder_id],
+            "mimeType": "application/pdf",
+        }
+        service = self._build_service()
+        return (
+            service.files()
+            .create(
+                body=metadata,
+                media_body=media,
+                fields="id,name,webViewLink",
+                supportsAllDrives=True,
+            )
+            .execute(num_retries=_UPLOAD_EXECUTE_RETRIES)
         )
 
     def upload_pdf(
@@ -72,52 +119,26 @@ class DriveClient:
         filename: str,
         folder_id: str,
     ) -> DriveUploadResponse:
-        media = MediaIoBaseUpload(io.BytesIO(pdf_bytes), mimetype="application/pdf", resumable=True)
-        metadata = {
-            "name": filename,
-            "parents": [folder_id],
-            "mimeType": "application/pdf",
-        }
-
-        # #region agent log (debug b90bd8 - H-1 concurrency check)
-        global _dbg_active_uploads
-        with _dbg_counter_lock:
-            _dbg_active_uploads += 1
-            _dbg_active = _dbg_active_uploads
-        _dbg_logger.info(
-            "[debug b90bd8] Drive upload START thread=%s active_uploads=%d size=%d file=%s",
-            threading.current_thread().name, _dbg_active, len(pdf_bytes), filename,
-        )
-        # #endregion
-
-        try:
-            created = (
-                self._service.files()
-                .create(
-                    body=metadata,
-                    media_body=media,
-                    fields="id,name,webViewLink",
-                    supportsAllDrives=True,
+        last_exc: Exception | None = None
+        for attempt in range(_MAX_UPLOAD_ATTEMPTS):
+            try:
+                created = self._execute_upload(pdf_bytes, filename, folder_id)
+                return DriveUploadResponse(
+                    fileId=created["id"],
+                    name=created["name"],
+                    webViewLink=created.get(
+                        "webViewLink",
+                        f"https://drive.google.com/file/d/{created['id']}/view",
+                    ),
                 )
-                .execute(http=self._build_http(), num_retries=_UPLOAD_NUM_RETRIES)
-            )
-        except Exception as exc:
-            raise UpstreamServiceError(f"Google Drive upload failed: {exc}") from exc
-        finally:
-            # #region agent log (debug b90bd8 - H-1 concurrency check)
-            with _dbg_counter_lock:
-                _dbg_active_uploads -= 1
-            _dbg_logger.info(
-                "[debug b90bd8] Drive upload END thread=%s file=%s",
-                threading.current_thread().name, filename,
-            )
-            # #endregion
+            except Exception as exc:
+                last_exc = exc
+                if attempt >= _MAX_UPLOAD_ATTEMPTS - 1 or not _is_retryable_upload_error(exc):
+                    break
+                time.sleep(_RETRY_BACKOFF_SECONDS[attempt])
 
-        return DriveUploadResponse(
-            fileId=created["id"],
-            name=created["name"],
-            webViewLink=created.get("webViewLink", f"https://drive.google.com/file/d/{created['id']}/view"),
-        )
+        assert last_exc is not None
+        raise UpstreamServiceError(f"Google Drive upload failed: {last_exc}") from last_exc
 
 
 def get_drive_client(settings: Settings) -> DriveClient:
