@@ -69,7 +69,7 @@ flowchart TB
 | `app/api/` | HTTP route handlers (`routes_ocr`, `routes_drive`, `routes_jobs`) and upload validation |
 | `app/services/ocr_pipeline.py` | Validates PDFs, calls Document AI, injects text layer (sync or file-based for jobs) |
 | `app/services/job_manager.py` | Async job queue, worker pool, on-disk job metadata and file I/O |
-| `app/services/drive_client.py` | Uploads searchable PDFs to a Shared Drive folder via service account |
+| `app/services/drive_client.py` | Uploads searchable PDFs to Shared Drive via resumable REST API (`requests` + ADC) |
 | `ocr_documentai_plugin/` | Document AI client, PDF splitting, PyMuPDF text-layer injection, GCS helpers |
 | `openapi.yml` | Design-first API contract; served at `/openapi.yml` and `/openapi.json`, drives `/docs` |
 | `deploy/gcp/` | Scripts and systemd units to run on a single GCE VM with Docker |
@@ -159,7 +159,31 @@ Statuses: `queued` → `running` → `succeeded` | `failed`. On restart, jobs le
 
 ### Google Drive integration
 
-Drive uploads use the same service account as Document AI (JSON key locally via `GOOGLE_APPLICATION_CREDENTIALS`, or the attached VM service account via Application Default Credentials in production). The client uses the `drive.file` scope and `supportsAllDrives=True` for Shared Drive folders. Sync endpoints upload immediately after OCR; async jobs upload optionally when `folder_id` is provided on job creation.
+Drive uploads use the **same service account** as Document AI:
+
+- **Local dev:** JSON key via `GOOGLE_APPLICATION_CREDENTIALS`
+- **GCE production:** attached VM service account via Application Default Credentials (no key file in the container)
+
+Two separate permission layers apply:
+
+| Layer | What to configure |
+|-------|-------------------|
+| **IAM (project)** | Service account with `roles/documentai.apiUser` (and GCS/Artifact Registry roles on the VM — see [`deploy/gcp/README.md`](deploy/gcp/README.md)) |
+| **Shared Drive folder** | Share the target folder with the service account email as **Content Manager** (Drive access is not granted via IAM roles) |
+| **VM OAuth scopes (GCE only)** | The VM must have `cloud-platform` **and** `https://www.googleapis.com/auth/drive`. `cloud-platform` alone covers Document AI/GCS but **not** Drive; missing the Drive scope yields `403 insufficient authentication scopes` on upload |
+
+**Upload transport:** [`app/services/drive_client.py`](app/services/drive_client.py) uses the Drive v3 **resumable upload REST API** with `google.auth.transport.requests.AuthorizedSession` (not `googleapiclient` / `httplib2`). Each upload gets its own session so multiple jobs can upload in parallel when they finish OCR at the same time:
+
+1. `POST` to `upload/drive/v3/files?uploadType=resumable&supportsAllDrives=true` with file metadata and `X-Upload-Content-Length`
+2. Read the `Location` response header (session URI)
+3. `PUT` the searchable PDF bytes to that URI
+4. Retry up to 3 times on transient network/5xx errors (new session per attempt)
+
+OAuth scope requested: `https://www.googleapis.com/auth/drive.file`. The folder must live in a **Shared Drive** (service accounts have no personal My Drive quota).
+
+**Async jobs:** pass `folder_id` on `POST /v1/jobs` to upload automatically after OCR, or call `POST /v1/jobs/{jobId}/drive` later. If upload fails, the job stays `succeeded` and the error is recorded in `driveUploadError` (OCR result remains downloadable). Use the full folder ID (typically 33 characters; a truncated ID causes `404 File not found`).
+
+**Sync:** `/v1/ocr/drive` uploads immediately after OCR using the same client (`folder_id` form field or `DRIVE_SHARED_FOLDER_ID` default).
 
 ### API contract and errors
 
@@ -192,9 +216,10 @@ per-page rasterization scratch.
    - Create a GCS bucket (required by config; used only if batch OCR is enabled)
 
 2. **Google Drive**
-   - Create or use a **Shared Drive** folder
-   - Share the folder with the service account email (Content Manager)
-   - Enable Google Drive API on the project
+   - Enable **Google Drive API** on the project
+   - Create or use a **Shared Drive** folder (not a personal My Drive folder)
+   - Share the folder with the service account email as **Content Manager**
+   - On GCE, ensure the VM OAuth access scopes include `https://www.googleapis.com/auth/drive` in addition to `cloud-platform` (see [`deploy/gcp/README.md`](deploy/gcp/README.md))
 
 3. **Runtime**
    - Python 3.11+
@@ -247,12 +272,21 @@ curl http://localhost:8000/v1/jobs/JOB_ID
 curl -OJ http://localhost:8000/v1/jobs/JOB_ID/result
 ```
 
-Optional: upload result to Google Drive on completion:
+Optional: upload result to Google Drive on completion (use the full Shared Drive folder ID):
 
 ```bash
 curl -X POST http://localhost:8000/v1/jobs \
   -F "file=@large-document.pdf" \
   -F "filename=searchable-document.pdf" \
+  -F "folder_id=YOUR_SHARED_DRIVE_FOLDER_ID"
+```
+
+Batch submit (multiple PDFs in parallel; each job uploads independently when OCR finishes):
+
+```bash
+API=http://YOUR_HOST:8000
+ls *.pdf | xargs -n1 -P4 -I{} curl -X POST "$API/v1/jobs" \
+  -F "file=@{}" \
   -F "folder_id=YOUR_SHARED_DRIVE_FOLDER_ID"
 ```
 
@@ -311,6 +345,11 @@ curl -X POST http://localhost:8000/v1/ocr/drive \
 Peak online calls ≈ `OCR_WORKER_CONCURRENCY × ONLINE_MAX_CONCURRENCY`. Lower
 `ONLINE_MAX_CONCURRENCY` if you see `429 RESOURCE_EXHAUSTED`; raise Document
 AI online pages/min quota before increasing both knobs. See `deploy/gcp/QUOTA.md`.
+
+When several jobs finish OCR together, up to `OCR_WORKER_CONCURRENCY` Drive
+uploads may run in parallel (one resumable session per job). Ensure the VM has
+the Drive OAuth scope and the Shared Drive folder is shared with the service
+account (see Google Drive integration above).
 
 ### Disk space
 
