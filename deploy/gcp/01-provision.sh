@@ -189,7 +189,7 @@ if ! gcloud compute instances describe "${VM_NAME}" \
     --boot-disk-size="${BOOT_DISK_SIZE}" \
     --boot-disk-type="${BOOT_DISK_TYPE}" \
     --service-account="${SA_EMAIL}" \
-    --scopes=cloud-platform \
+    --scopes=cloud-platform,https://www.googleapis.com/auth/drive \
     --tags="${NETWORK_TAG}" \
     --metadata=enable-oslogin=TRUE \
     --project="${PROJECT_ID}"
