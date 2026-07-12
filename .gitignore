@@ -12,3 +12,4 @@ build/
 *.pdf
 /gcp-credentials.json
 /gcp-credentials-development.json
+/ocrapi.wiki
