@@ -13,3 +13,4 @@ build/
 /gcp-credentials.json
 /gcp-credentials-development.json
 /ocrapi.wiki
+/deploy/gcp/ocrapi.env.internal.example
