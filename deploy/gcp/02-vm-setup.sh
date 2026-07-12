@@ -60,6 +60,35 @@ mkdir -p "${MOUNT_POINT}/jobs"
 echo "==> ${MOUNT_POINT} ready: $(df -h "${MOUNT_POINT}" | tail -1)"
 
 ############################
+# 1b. TLS certificate      #
+############################
+# uvicorn terminates TLS in-process (see ocrapi.service). A long-lived
+# self-signed cert lives on the data disk so it survives container restarts and
+# image redeploys — clients keep trusting the same cert. Idempotent.
+TLS_DIR="${MOUNT_POINT}/tls"
+mkdir -p "${TLS_DIR}"
+if [[ ! -f "${TLS_DIR}/cert.pem" ]]; then
+  echo "==> Generating self-signed TLS certificate..."
+  META="http://metadata.google.internal/computeMetadata/v1/instance/network-interfaces/0"
+  EXT_IP="$(curl -s -H 'Metadata-Flavor: Google' "${META}/access-configs/0/external-ip" || true)"
+  INT_IP="$(curl -s -H 'Metadata-Flavor: Google' "${META}/ip" || true)"
+  SAN="DNS:localhost,IP:127.0.0.1"
+  [[ -n "${INT_IP}" ]] && SAN="${SAN},IP:${INT_IP}"
+  [[ -n "${EXT_IP}" ]] && SAN="${SAN},IP:${EXT_IP}"
+  # Add an extra name (DNS alias or reserved IP) via TLS_EXTRA_SAN, e.g.
+  #   sudo TLS_EXTRA_SAN="DNS:ocrapi.intranet.local" bash 02-vm-setup.sh
+  [[ -n "${TLS_EXTRA_SAN:-}" ]] && SAN="${SAN},${TLS_EXTRA_SAN}"
+  openssl req -x509 -newkey rsa:2048 -nodes \
+    -keyout "${TLS_DIR}/key.pem" -out "${TLS_DIR}/cert.pem" \
+    -days 3650 -subj "/CN=ocrapi" -addext "subjectAltName=${SAN}"
+  chmod 600 "${TLS_DIR}/key.pem"
+  chmod 644 "${TLS_DIR}/cert.pem"
+  echo "==> TLS cert generated (SAN: ${SAN})"
+else
+  echo "==> TLS cert already present at ${TLS_DIR}; skipping."
+fi
+
+############################
 # 2. Install Docker        #
 ############################
 if ! command -v docker >/dev/null 2>&1; then
@@ -119,6 +148,7 @@ VM setup complete.
 Mounted:        ${MOUNT_POINT} ($(df -h --output=size "${MOUNT_POINT}" | tail -1 | xargs))
 Docker:         $(docker --version)
 Systemd units:  ocrapi.service, ocrapi-cleanup.timer
+TLS cert:       ${TLS_DIR}/cert.pem (self-signed; copy to clients or use curl -k)
 
 Next steps:
   1) Edit /etc/ocrapi.env if needed (GCP_PROJECT_ID, processor, Drive ID).
