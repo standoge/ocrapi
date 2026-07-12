@@ -15,6 +15,6 @@ def test_openapi_spec_is_valid():
 
     validate(spec)
     assert "/v1/ocr" in spec["paths"]
-    assert "/v1/ocr/drive" in spec["paths"]
+    assert "/v1/ocr/drive" not in spec["paths"]
     assert "/v1/jobs" in spec["paths"]
     assert "/healthz" in spec["paths"]

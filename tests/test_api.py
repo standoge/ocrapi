@@ -26,10 +26,10 @@ async def test_healthz(client):
 
 
 @pytest.mark.asyncio
-async def test_ocr_returns_pdf(client):
+async def test_ocr_returns_plain_text(client):
     with patch(
-        "app.api.routes_ocr.run_ocr_pipeline",
-        new=AsyncMock(return_value=(MINIMAL_PDF, 1)),
+        "app.api.routes_ocr.run_ocr_text_pipeline",
+        new=AsyncMock(return_value=("extracted text layer", 1)),
     ):
         response = await client.post(
             "/v1/ocr",
@@ -37,8 +37,8 @@ async def test_ocr_returns_pdf(client):
         )
 
     assert response.status_code == 200
-    assert response.headers["content-type"].startswith("application/pdf")
-    assert response.content.startswith(b"%PDF")
+    assert response.headers["content-type"].startswith("text/plain")
+    assert response.text == "extracted text layer"
 
 
 @pytest.mark.asyncio
@@ -49,35 +49,6 @@ async def test_ocr_rejects_non_pdf(client):
     )
     assert response.status_code == 400
     assert response.headers["content-type"] == "application/problem+json"
-
-
-@pytest.mark.asyncio
-async def test_ocr_drive_returns_metadata(client):
-    from app.schemas import DriveUploadResponse
-
-    mock_result = DriveUploadResponse(
-        fileId="abc123",
-        name="sample_ocr.pdf",
-        webViewLink="https://drive.google.com/file/d/abc123/view",
-    )
-
-    with patch(
-        "app.api.routes_drive.run_ocr_pipeline",
-        new=AsyncMock(return_value=(MINIMAL_PDF, 1)),
-    ), patch(
-        "app.api.routes_drive.get_drive_client"
-    ) as mock_drive_factory:
-        mock_drive_factory.return_value.upload_pdf.return_value = mock_result
-        response = await client.post(
-            "/v1/ocr/drive",
-            files={"file": ("sample.pdf", MINIMAL_PDF, "application/pdf")},
-        )
-
-    assert response.status_code == 200
-    payload = response.json()
-    assert payload["fileId"] == "abc123"
-    assert payload["name"] == "sample_ocr.pdf"
-    assert payload["webViewLink"].startswith("https://drive.google.com/")
 
 
 @pytest.mark.asyncio
