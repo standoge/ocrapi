@@ -6,22 +6,22 @@ scratch, unused by the current job pipeline). Async jobs split PDFs into
 small chunks, run concurrent online `processDocument` calls, and the VM
 assembles searchable PDFs with PyMuPDF — no Ghostscript rasterization.
 
-The app is served directly over **plain HTTP on port 8000** (no TLS / reverse
-proxy). This is the simplest setup for testing. Note that uploads and results
-travel unencrypted; if you later want HTTPS, put a reverse proxy (Caddy,
-nginx, or a GCP HTTPS Load Balancer) in front and bind the container to
-`127.0.0.1:8000` in [`ocrapi.service`](./ocrapi.service).
+The app is served over **HTTPS on port 8000**, with TLS terminated in-process by
+uvicorn (`--ssl-keyfile` / `--ssl-certfile`) — no reverse proxy. A long-lived
+self-signed certificate is generated once by [`02-vm-setup.sh`](./02-vm-setup.sh)
+and stored on the data disk at `/data/tls`, so uploads and results are encrypted
+in transit. See [TLS / certificate](#tls--certificate) for client trust.
 
 ## Files
 
 | File                                                 | Where it runs    | Purpose                                                            |
 | ---------------------------------------------------- | ---------------- | ------------------------------------------------------------------ |
 | [`01-provision.sh`](./01-provision.sh)               | dev machine      | Create SA, GCS bucket, Artifact Registry, firewall, data disk, VM (SA + Drive OAuth scopes). |
-| [`02-vm-setup.sh`](./02-vm-setup.sh)                 | VM (root)        | Format/mount data disk, install Docker, register systemd units.    |
+| [`02-vm-setup.sh`](./02-vm-setup.sh)                 | VM (root)        | Format/mount data disk, generate self-signed TLS cert, install Docker, register systemd units. |
 | [`03-build-and-push.sh`](./03-build-and-push.sh)     | dev machine      | Build linux/amd64 image, push to Artifact Registry.                |
 | [`04-run.sh`](./04-run.sh)                           | VM (root)        | Pin image tag, (re)start `ocrapi.service`, health-check.           |
 | [`ocrapi.env.example`](./ocrapi.env.example)         | VM (`/etc/ocrapi.env`) | Production env: GCS bucket, concurrency, paths, no key file.   |
-| [`ocrapi.service`](./ocrapi.service)                 | VM systemd unit  | Runs the container on `0.0.0.0:8000` with `/data/jobs` bind mount. |
+| [`ocrapi.service`](./ocrapi.service)                 | VM systemd unit  | Runs the container on `0.0.0.0:8000` over TLS, with `/data/jobs` and `/data/tls` bind mounts. |
 | [`ocrapi-cleanup.sh`](./ocrapi-cleanup.sh)           | VM (`/usr/local/bin`) | Prunes old job folders.                                         |
 | [`ocrapi-cleanup.service`](./ocrapi-cleanup.service) | VM systemd unit  | Oneshot wrapper around the cleanup script.                         |
 | [`ocrapi-cleanup.timer`](./ocrapi-cleanup.timer)     | VM systemd timer | Runs the cleanup daily + 10 min after boot.                        |
@@ -59,12 +59,51 @@ sudo IMAGE=us-central1-docker.pkg.dev/YOUR_PROJECT/ocrapi/ocrapi:TAG \
      bash deploy/gcp/04-run.sh                   # starts ocrapi.service, hits /healthz
 ```
 
-The API is now served over plain HTTP on the VM's external IP. From your
-machine (substitute the external IP printed by `01-provision.sh`):
+The API is now served over HTTPS on the VM's external IP. From your machine
+(substitute the external IP printed by `01-provision.sh`). Trust the cert with
+`--cacert` after copying it (see [TLS / certificate](#tls--certificate)), or use
+`-k` to skip identity verification — traffic is encrypted either way:
 
 ```bash
-curl -sf http://EXTERNAL_IP:8000/healthz
-# Swagger UI: http://EXTERNAL_IP:8000/docs
+curl -sfk https://EXTERNAL_IP:8000/healthz
+# Swagger UI: https://EXTERNAL_IP:8000/docs
+```
+
+## TLS / certificate
+
+TLS is terminated inside uvicorn (`--ssl-keyfile` / `--ssl-certfile` in
+[`ocrapi.service`](./ocrapi.service)) — there is no reverse proxy. `02-vm-setup.sh`
+generates a self-signed certificate on the data disk and reuses it on every rerun:
+
+| Item | Value |
+|------|-------|
+| Location | `/data/tls/cert.pem`, `/data/tls/key.pem` (survives redeploys) |
+| Validity | 10 years (`-days 3650`) — no renewal workflow needed |
+| SANs | `localhost`, `127.0.0.1`, and the VM's internal + external IPs (from the metadata server at setup time) |
+
+**Trust it on clients** — copy the cert once and pass it with `--cacert`:
+
+```bash
+gcloud compute scp ocrapi-vm:/data/tls/cert.pem . --zone=us-central1-a --project=YOUR_PROJECT
+curl --cacert cert.pem https://EXTERNAL_IP:8000/healthz
+```
+
+Or skip identity verification with `curl -k` — traffic is still encrypted; you only
+lose protection against an active man-in-the-middle (passive sniffing is already
+defeated by the encryption).
+
+**IP-SAN caveat.** The cert pins the VM's IPs. The default external IP is *ephemeral*,
+so a VM stop/start can change it and break `--cacert` validation. Either **reserve a
+static external IP** (recommended), reach the VM by its stable internal IP, or
+regenerate the cert after the IP changes.
+
+**Regenerate** (e.g. after an IP change or to add a name):
+
+```bash
+sudo rm /data/tls/cert.pem /data/tls/key.pem
+# optional: add a DNS alias or reserved IP to the cert
+sudo TLS_EXTRA_SAN="DNS:ocrapi.intranet.local" bash deploy/gcp/02-vm-setup.sh
+sudo bash deploy/gcp/04-run.sh   # restart to pick up the new cert
 ```
 
 ## Day-2 operations
@@ -92,8 +131,8 @@ sudo IMAGE=us-central1-docker.pkg.dev/YOUR_PROJECT/ocrapi/ocrapi:NEW_TAG \
 - **Async jobs** (`POST /v1/jobs`): split PDF into chunks → concurrent online
   `processDocument` per chunk → PyMuPDF invisible text layer → local
   `output.pdf` → optional upload to Shared Drive.
-- **Sync OCR** (`POST /v1/ocr`): online `processDocument` on the whole PDF (small
-  docs only) → same PyMuPDF injector.
+- **Sync OCR** (`POST /v1/ocr`): same chunked online `processDocument` path →
+  returns the extracted text layer as `text/plain` (no PyMuPDF injection).
 - **GCS bucket** is provisioned but unused by the current async pipeline.
 - Default VM sizing is `c4-standard-4` with a 50 GB data disk (input/output PDFs
   only; no page rasterization scratch).
@@ -176,8 +215,8 @@ Async jobs: pass `folder_id` on `POST /v1/jobs`, or retry later with
 Example batch (client-side parallelism; each job uploads on its own when ready):
 
 ```bash
-API=http://EXTERNAL_IP:8000
-ls *.pdf | xargs -n1 -P4 -I{} curl -X POST "$API/v1/jobs" \
+API=https://EXTERNAL_IP:8000
+ls *.pdf | xargs -n1 -P4 -I{} curl --cacert cert.pem -X POST "$API/v1/jobs" \
   -F "file=@{}" \
   -F "folder_id=YOUR_SHARED_DRIVE_FOLDER_ID"
 ```
