@@ -50,13 +50,8 @@ def _format_ocr_failure(exc: Exception, settings: Settings) -> str:
     return f"OCR pipeline failed: {exc}"
 
 
-def _validate_pdf(
-    input_path: Path,
-    settings: Settings,
-    *,
-    max_pages: int | None = None,
-) -> int:
-    limit = max_pages if max_pages is not None else settings.max_pdf_pages
+def _validate_pdf(input_path: Path, settings: Settings) -> int:
+    limit = settings.max_pdf_pages
     try:
         reader = PdfReader(str(input_path))
         page_count = len(reader.pages)
@@ -74,32 +69,6 @@ def _validate_pdf(
     return page_count
 
 
-def _run_online_ocr_sync(
-    input_path: Path,
-    output_path: Path,
-    settings: Settings,
-    *,
-    max_pages: int | None = None,
-    job_id: str | None = None,
-    original_filename: str | None = None,
-) -> int:
-    page_count = _validate_pdf(input_path, settings, max_pages=max_pages)
-    filename = original_filename or input_path.name
-    log_prefix = f"[job={job_id[:8]} | {filename}] " if job_id else f"[{filename}] "
-    logger.info("%sRunning online Document AI OCR (%d pages)", log_prefix, page_count)
-
-    pdf_bytes = input_path.read_bytes()
-    document = get_documentai_client(settings).process_pdf_online(pdf_bytes)
-    processed_pages = inject_text_layer(
-        input_path,
-        [document],
-        output_path,
-        **_textlayer_kwargs(settings),
-    )
-    logger.info("%sOnline OCR completed (%d pages)", log_prefix, processed_pages)
-    return page_count
-
-
 def _process_chunk_online(
     chunk_index: int,
     start_index: int,
@@ -112,18 +81,17 @@ def _process_chunk_online(
     return chunk_index, start_index, document, elapsed
 
 
-def _run_chunked_online_sync(
+def _ocr_chunks_online(
     input_path: Path,
-    output_path: Path,
     settings: Settings,
-    *,
-    job_id: str | None = None,
-    original_filename: str | None = None,
-) -> int:
-    pipeline_start = perf_counter()
+    log_prefix: str,
+) -> tuple[list[tuple[int, documentai_document.Document]], int, float, float]:
+    """Split a PDF into chunks and OCR them concurrently via Document AI online.
+
+    Returns ordered (start_index, document) chunk results, the page count, and
+    the split/OCR wall-clock seconds.
+    """
     page_count = _validate_pdf(input_path, settings)
-    filename = original_filename or input_path.name
-    log_prefix = f"[job={job_id[:8]} | {filename}] " if job_id else f"[{filename}] "
 
     split_start = perf_counter()
     chunks = split_pdf(
@@ -208,6 +176,26 @@ def _run_chunked_online_sync(
     ]
     if len(chunk_results) != len(chunks):
         raise UpstreamServiceError("OCR pipeline failed: missing chunk results")
+
+    return chunk_results, page_count, split_seconds, ocr_seconds
+
+
+def _run_chunked_online_sync(
+    input_path: Path,
+    output_path: Path,
+    settings: Settings,
+    *,
+    job_id: str | None = None,
+    original_filename: str | None = None,
+) -> int:
+    pipeline_start = perf_counter()
+    filename = original_filename or input_path.name
+    log_prefix = f"[job={job_id[:8]} | {filename}] " if job_id else f"[{filename}] "
+
+    chunk_results, page_count, split_seconds, ocr_seconds = _ocr_chunks_online(
+        input_path, settings, log_prefix
+    )
+    pages_per_min = page_count / (ocr_seconds / 60) if ocr_seconds > 0 else 0.0
 
     textlayer_start = perf_counter()
     processed_pages = inject_text_layer_chunks(
@@ -308,26 +296,44 @@ def run_ocr_pipeline_file(
     return page_count
 
 
-async def run_ocr_pipeline(pdf_bytes: bytes, settings: Settings) -> tuple[bytes, int]:
-    """Run OCR on PDF bytes and return searchable PDF bytes and page count."""
+def _extract_text_chunked_sync(
+    input_path: Path,
+    settings: Settings,
+    *,
+    original_filename: str | None = None,
+) -> tuple[str, int]:
+    filename = original_filename or input_path.name
+    log_prefix = f"[{filename}] "
+
+    chunk_results, page_count, _, _ = _ocr_chunks_online(input_path, settings, log_prefix)
+    text = "\n".join(document.text or "" for _, document in chunk_results)
+    logger.info(
+        "%sText extraction completed (%d pages, %d chars)",
+        log_prefix,
+        page_count,
+        len(text),
+    )
+    return text, page_count
+
+
+async def run_ocr_text_pipeline(
+    pdf_bytes: bytes,
+    settings: Settings,
+    original_filename: str | None = None,
+) -> tuple[str, int]:
+    """Run OCR on PDF bytes and return the extracted plain text and page count."""
     with tempfile.TemporaryDirectory(prefix="ocrapi_") as tmpdir:
-        tmp = Path(tmpdir)
-        input_path = tmp / "input.pdf"
-        output_path = tmp / "output.pdf"
+        input_path = Path(tmpdir) / "input.pdf"
         input_path.write_bytes(pdf_bytes)
 
         try:
-            page_count = await asyncio.to_thread(
-                _run_online_ocr_sync,
+            return await asyncio.to_thread(
+                _extract_text_chunked_sync,
                 input_path,
-                output_path,
                 settings,
-                max_pages=settings.sync_max_pages,
+                original_filename=original_filename,
             )
+        except UnprocessablePdfError:
+            raise
         except Exception as exc:
             raise UpstreamServiceError(_format_ocr_failure(exc, settings)) from exc
-
-        if not output_path.exists():
-            raise UpstreamServiceError("OCR completed but output PDF was not created")
-
-        return output_path.read_bytes(), page_count

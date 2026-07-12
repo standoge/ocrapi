@@ -12,7 +12,6 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
 from fastapi.openapi.docs import get_swagger_ui_html
 
-from app.api.routes_drive import router as drive_router
 from app.api.routes_jobs import router as jobs_router
 from app.api.routes_ocr import router as ocr_router
 from app.config import get_settings
@@ -125,5 +124,4 @@ async def swagger_ui():
 
 
 app.include_router(ocr_router)
-app.include_router(drive_router)
 app.include_router(jobs_router)
