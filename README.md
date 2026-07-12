@@ -1,6 +1,6 @@
 # DocAI OCR API
 
-REST API that accepts a PDF and returns a searchable PDF using **GCP Document AI** for OCR and **PyMuPDF** for invisible text-layer injection.
+REST API for OCR over PDFs using **GCP Document AI**. Async jobs produce a searchable PDF via **PyMuPDF** invisible text-layer injection; the sync endpoint returns the extracted text layer as plain text.
 
 ## Features
 
@@ -8,8 +8,7 @@ REST API that accepts a PDF and returns a searchable PDF using **GCP Document AI
 - `GET /v1/jobs/{jobId}` — poll job status
 - `GET /v1/jobs/{jobId}/result` — download searchable PDF when ready
 - `POST /v1/jobs/{jobId}/drive` — upload a finished job's result to Google Drive
-- `POST /v1/ocr` — upload a PDF, receive a searchable PDF synchronously (small docs only)
-- `POST /v1/ocr/drive` — OCR a PDF and upload the result to a Google Drive Shared Drive
+- `POST /v1/ocr` — upload a PDF, receive its OCR text layer synchronously as `text/plain`
 - Design-first OpenAPI contract at `/openapi.yml`
 
 ## Documentation
@@ -117,19 +116,15 @@ curl -X POST http://localhost:8000/v1/jobs/JOB_ID/drive \
   -d '{}'
 ```
 
-### Sync OCR (small documents)
+### Sync OCR (plain-text extraction)
 
-For quick tests or small PDFs (up to `SYNC_MAX_PAGES`, default 15):
+Upload a PDF and get its OCR text layer back as plain text in the same request. Large PDFs
+are split into chunks processed concurrently; the connection stays open until OCR completes:
 
 ```bash
 curl -X POST http://localhost:8000/v1/ocr \
   -F "file=@document.pdf" \
-  -o searchable.pdf
-
-curl -X POST http://localhost:8000/v1/ocr/drive \
-  -F "file=@document.pdf" \
-  -F "filename=searchable-document.pdf" \
-  -F "folder_id=YOUR_SHARED_DRIVE_FOLDER_ID"
+  -o document.txt
 ```
 
 ## Configuration
@@ -143,13 +138,12 @@ curl -X POST http://localhost:8000/v1/ocr/drive \
 | `GCS_BUCKET` | — | GCS bucket for batch OCR scratch (unused by current async jobs) |
 | `BATCH_TIMEOUT_SECONDS` | `1800` | Timeout for batch OCR LRO polling |
 | `BATCH_POLL_INTERVAL_SECONDS` | `10` | Poll interval for batch OCR |
-| `DRIVE_SHARED_FOLDER_ID` | — | Optional default Shared Drive folder for `/v1/ocr/drive` and `/v1/jobs/{jobId}/drive` when folder ID is omitted |
+| `DRIVE_SHARED_FOLDER_ID` | — | Optional default Shared Drive folder for `/v1/jobs` and `/v1/jobs/{jobId}/drive` when folder ID is omitted |
 | `MAX_UPLOAD_BYTES` | `629145600` (600 MB) | Maximum upload size for job and sync endpoints |
-| `MAX_PDF_PAGES` | `2000` | Maximum pages for async job processing |
-| `SYNC_MAX_PAGES` | `15` | Maximum pages for sync `/v1/ocr` and `/v1/ocr/drive` |
-| `ONLINE_CHUNK_PAGES` | `15` | Maximum pages per online OCR chunk (async jobs) |
+| `MAX_PDF_PAGES` | `2000` | Maximum pages per PDF (sync and async) |
+| `ONLINE_CHUNK_PAGES` | `15` | Maximum pages per online OCR chunk |
 | `ONLINE_CHUNK_MAX_BYTES` | `18874368` (18 MB) | Maximum bytes per online OCR chunk |
-| `ONLINE_MAX_CONCURRENCY` | `8` | Concurrent online `processDocument` calls per async job |
+| `ONLINE_MAX_CONCURRENCY` | `8` | Concurrent online `processDocument` calls per PDF |
 | `PDF_SAVE_INCREMENTAL` | `true` | PyMuPDF incremental save when injecting text layer |
 | `PDF_USE_TEXTWRITER` | `true` | PyMuPDF TextWriter for faster token injection |
 | `JOBS_DIR` | `jobs` | Directory for job input/output files |

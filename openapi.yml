@@ -3,8 +3,10 @@ info:
   title: DocAI OCR API
   version: 1.0.0
   description: |
-    REST API that accepts a PDF and returns a searchable PDF using GCP Document AI
-    and PyMuPDF text-layer injection. Includes an endpoint to store results in Google Drive.
+    REST API for OCR over PDFs using GCP Document AI. The synchronous /v1/ocr
+    endpoint extracts and returns the plain-text layer of an uploaded PDF.
+    The async /v1/jobs endpoints produce searchable PDFs (PyMuPDF text-layer
+    injection) with optional delivery to Google Drive.
   contact:
     name: DocAI OCR API
 servers:
@@ -27,11 +29,14 @@ paths:
   /v1/ocr:
     post:
       operationId: ocrPdf
-      summary: OCR a PDF and return searchable PDF
+      summary: OCR a PDF and return its text layer as plain text
       description: |
         Accepts a PDF file via multipart upload, runs OCR using GCP Document AI
-        online processDocument, and returns the same PDF with an embedded searchable
-        text layer via PyMuPDF. Limited to small documents (up to SYNC_MAX_PAGES pages).
+        online processDocument (splitting large PDFs into chunks processed
+        concurrently), and returns the extracted text layer as plain text.
+        A ready-to-use tool: the request stays open until OCR completes.
+        Supports documents up to MAX_PDF_PAGES pages. For searchable PDF output
+        or very large documents, use the async /v1/jobs endpoints instead.
       tags:
         - OCR
       requestBody:
@@ -49,65 +54,14 @@ paths:
                   description: PDF file to OCR
       responses:
         "200":
-          description: Searchable PDF with embedded invisible text layer
+          description: Plain text extracted from the PDF via OCR
           content:
-            application/pdf:
+            text/plain:
               schema:
                 type: string
-                format: binary
-          headers:
-            Content-Disposition:
-              schema:
-                type: string
-              description: Attachment filename for the searchable PDF
-        "400":
-          $ref: "#/components/responses/BadRequest"
-        "413":
-          $ref: "#/components/responses/PayloadTooLarge"
-        "422":
-          $ref: "#/components/responses/UnprocessableEntity"
-        "500":
-          $ref: "#/components/responses/InternalError"
-        "502":
-          $ref: "#/components/responses/BadGateway"
-  /v1/ocr/drive:
-    post:
-      operationId: ocrPdfToDrive
-      summary: OCR a PDF and upload to Google Drive
-      description: |
-        Accepts a PDF file, runs OCR, uploads the searchable PDF to a Google Drive
-        Shared Drive folder, and returns file metadata. Provide `folder_id` in the
-        request, or configure `DRIVE_SHARED_FOLDER_ID` as a server default.
-      tags:
-        - OCR
-      requestBody:
-        required: true
-        content:
-          multipart/form-data:
-            schema:
-              type: object
-              required:
-                - file
-              properties:
-                file:
-                  type: string
-                  format: binary
-                  description: PDF file to OCR
-                filename:
-                  type: string
-                  description: Optional output filename in Drive (defaults to original name with _ocr suffix)
-                  example: searchable-document.pdf
-                folder_id:
-                  type: string
-                  description: Optional Shared Drive folder ID (overrides server default)
-                  example: 1abcDEFghijklmnop
-      responses:
-        "200":
-          description: Drive upload metadata
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/DriveUploadResponse"
+              example: |
+                First page text...
+                Second page text...
         "400":
           $ref: "#/components/responses/BadRequest"
         "413":

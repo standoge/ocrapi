@@ -6,8 +6,9 @@ chunks (≤ `ONLINE_CHUNK_PAGES` pages and ≤ `ONLINE_CHUNK_MAX_BYTES` each) an
 OCR'd concurrently via online `processDocument`. The VM assembles the
 searchable PDF with PyMuPDF — no GCS upload and no batch LRO for jobs.
 
-The **sync** endpoint (`POST /v1/ocr`) still uses online `processDocument` on
-whole PDFs (small docs only, up to `SYNC_MAX_PAGES`).
+The **sync** endpoint (`POST /v1/ocr`) uses the same chunked online
+`processDocument` path and returns the extracted text layer as plain text
+(up to `MAX_PDF_PAGES`), so it draws on the same quota.
 
 ## Default vs. effective limits
 
