@@ -1,10 +1,10 @@
 # Changelog
 
-Lorem
+Stable version. Main features:
+- Endpoint to be use as tool to get only the text layer as plain-text
+- Endpoint for end-user with binary pdf with text layer included
 
-## [Unreleased]
-
-## [0.2.0] - 2026-07-12
+## [0.9.0] - 2026-07-12
 ### Added
-- Lorem
-- Lorem
+- TLS auto-signed support
+- Endpoint with plain-text OCR content as output
