@@ -22,7 +22,9 @@ class Settings(BaseSettings):
 
     drive_shared_folder_id: str | None = None
 
-    gcs_bucket: str
+    # Only required for the legacy Document AI batch path; the online
+    # sync/async pipelines never touch GCS.
+    gcs_bucket: str | None = None
     batch_timeout_seconds: int = 1800
     batch_poll_interval_seconds: int = 10
 

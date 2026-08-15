@@ -21,6 +21,12 @@ class GCSClient:
     """Thin wrapper around Cloud Storage for batch OCR scratch objects."""
 
     def __init__(self, settings: Settings) -> None:
+        if not settings.gcs_bucket:
+            raise ValueError(
+                "GCS_BUCKET is not configured. It is only needed for the "
+                "Document AI batch path; set it (and provision the bucket) "
+                "before using batch OCR."
+            )
         self._settings = settings
         self._bucket_name = settings.gcs_bucket
         credentials_path = settings.credentials_path

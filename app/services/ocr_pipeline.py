@@ -44,7 +44,7 @@ def _format_ocr_failure(exc: Exception, settings: Settings) -> str:
         sa_email = settings.service_account_email or "unknown service account"
         return (
             "GCP Cloud Storage permission denied for batch OCR. Grant "
-            f"'roles/storage.objectAdmin' on bucket '{settings.gcs_bucket}' to "
+            f"'roles/storage.objectAdmin' on bucket '{settings.gcs_bucket or '(unset)'}' to "
             f"'{sa_email}'."
         )
     return f"OCR pipeline failed: {exc}"
