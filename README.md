@@ -26,9 +26,9 @@ To run and operate this project you should be comfortable with:
 ## Required resources
 
 1. **GCP project** with:
-   - Document AI API enabled, and a **Document OCR** processor (note its `processor_id` and `location`)
+   - Document AI API enabled, and a **Document OCR** processor (note its `processor_id` and `location`). For GCE deploys, [`deploy/gcp/01-provision.sh`](deploy/gcp/01-provision.sh) creates the processor (and everything else) automatically; for local dev you can reuse the processor it created or make one in the console
    - A service account with `roles/documentai.apiUser` (JSON key for local dev; on GCE the VM's attached service account is used — no key file)
-   - A GCS bucket (required by config; used only if batch OCR is enabled)
+   - A GCS bucket — **optional**, only needed for the legacy Document AI batch path (`ENABLE_BATCH_BUCKET=true` in the provision script)
 
 2. **Google Drive** (optional, for result delivery):
    - Google Drive API enabled on the project

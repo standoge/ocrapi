@@ -1,10 +1,12 @@
 # Deploying ocrapi to a single GCE VM
 
 This folder contains everything needed to run ocrapi on a Compute Engine VM
-with Docker, a data disk for `JOBS_DIR`, and a GCS bucket (legacy batch
-scratch, unused by the current job pipeline). Async jobs split PDFs into
-small chunks, run concurrent online `processDocument` calls, and the VM
-assembles searchable PDFs with PyMuPDF — no Ghostscript rasterization.
+with Docker and a data disk for `JOBS_DIR`. Provisioning is fully scripted —
+including the Document AI OCR processor, a reserved static IP, and the
+runtime env — so a fresh GCP project deploys with no by-hand configuration.
+Async jobs split PDFs into small chunks, run concurrent online
+`processDocument` calls, and the VM assembles searchable PDFs with PyMuPDF —
+no Ghostscript rasterization.
 
 The app is served over **HTTPS on port 8000**, with TLS terminated in-process by
 uvicorn (`--ssl-keyfile` / `--ssl-certfile`) — no reverse proxy. A long-lived
@@ -16,7 +18,7 @@ in transit. See [TLS / certificate](#tls--certificate) for client trust.
 
 | File                                                 | Where it runs    | Purpose                                                            |
 | ---------------------------------------------------- | ---------------- | ------------------------------------------------------------------ |
-| [`01-provision.sh`](./01-provision.sh)               | dev machine      | Create SA, GCS bucket, Artifact Registry, firewall, data disk, VM (SA + Drive OAuth scopes). |
+| [`01-provision.sh`](./01-provision.sh)               | dev machine      | Create Document AI OCR processor, SA, static IP, Artifact Registry, firewall, data disk, VM (SA + Drive OAuth scopes); publish the filled runtime env to VM metadata. GCS bucket only with `ENABLE_BATCH_BUCKET=true`. |
 | [`02-vm-setup.sh`](./02-vm-setup.sh)                 | VM (root)        | Format/mount data disk, generate self-signed TLS cert, install Docker, register systemd units. |
 | [`03-build-and-push.sh`](./03-build-and-push.sh)     | dev machine      | Build linux/amd64 image, push to Artifact Registry.                |
 | [`04-run.sh`](./04-run.sh)                           | VM (root)        | Pin image tag, (re)start `ocrapi.service`, health-check.           |
@@ -36,7 +38,11 @@ Replace `YOUR_PROJECT` with your GCP project ID (e.g. `anda-dev-457721`).
 gcloud config set project YOUR_PROJECT
 # Optional but recommended: lock the app port to your own IP instead of the world.
 # APP_SOURCE_CIDR="203.0.113.4/32" bash deploy/gcp/01-provision.sh
+# Optional: bake the Drive folder into the generated env, or enable the batch bucket:
+# DRIVE_SHARED_FOLDER_ID="..." ENABLE_BATCH_BUCKET=true bash deploy/gcp/01-provision.sh
 bash deploy/gcp/01-provision.sh                  # ~2 min
+# Creates the Document AI OCR processor, reserves a static IP, and publishes a
+# ready-to-use /etc/ocrapi.env to VM metadata — nothing to fill in by hand.
 
 # Share the Drive folder with the service account printed above
 # (Content Manager on the Shared Drive folder).
@@ -47,8 +53,9 @@ gcloud compute ssh ocrapi-vm --zone=us-central1-a
 # Copy the deploy/ folder onto the VM (e.g. git clone the repo) and:
 sudo bash deploy/gcp/02-vm-setup.sh              # mounts /data, installs docker
 
-# Edit /etc/ocrapi.env if you need to change GCP_PROJECT_ID / processor / GCS bucket / Drive ID
-sudoedit /etc/ocrapi.env
+# /etc/ocrapi.env is installed automatically from the metadata published by
+# 01-provision.sh. Edit only if you want to override the generated defaults:
+# sudoedit /etc/ocrapi.env
 
 # --- back on dev machine ---
 bash deploy/gcp/03-build-and-push.sh             # builds + pushes to Artifact Registry
@@ -92,10 +99,10 @@ Or skip identity verification with `curl -k` — traffic is still encrypted; you
 lose protection against an active man-in-the-middle (passive sniffing is already
 defeated by the encryption).
 
-**IP-SAN caveat.** The cert pins the VM's IPs. The default external IP is *ephemeral*,
-so a VM stop/start can change it and break `--cacert` validation. Either **reserve a
-static external IP** (recommended), reach the VM by its stable internal IP, or
-regenerate the cert after the IP changes.
+**IP-SAN caveat.** The cert pins the VM's IPs. `01-provision.sh` reserves a **static
+external IP** (`ocrapi-ip`) and creates the VM with it, so the SAN stays valid across
+stop/start. On a VM created before this (with an ephemeral IP), either promote the IP
+to static or regenerate the cert after the IP changes.
 
 **Regenerate** (e.g. after an IP change or to add a name):
 
@@ -133,7 +140,8 @@ sudo IMAGE=us-central1-docker.pkg.dev/YOUR_PROJECT/ocrapi/ocrapi:NEW_TAG \
   `output.pdf` → optional upload to Shared Drive.
 - **Sync OCR** (`POST /v1/ocr`): same chunked online `processDocument` path →
   returns the extracted text layer as `text/plain` (no PyMuPDF injection).
-- **GCS bucket** is provisioned but unused by the current async pipeline.
+- **GCS bucket** is only needed by the legacy Document AI batch path and is NOT
+  provisioned by default (`ENABLE_BATCH_BUCKET=true` to create it).
 - Default VM sizing is `c4-standard-4` with a 50 GB data disk (input/output PDFs
   only; no page rasterization scratch).
 
@@ -149,7 +157,7 @@ in the container (`GOOGLE_APPLICATION_CREDENTIALS` is intentionally unset in
 | Requirement | How |
 |-------------|-----|
 | Document AI | IAM role `roles/documentai.apiUser` on the project (granted by `01-provision.sh`) |
-| GCS batch bucket | IAM `roles/storage.objectAdmin` on `gs://PROJECT-ocrapi-batch` |
+| GCS batch bucket (optional) | IAM `roles/storage.objectAdmin` on `gs://PROJECT-ocrapi-batch` (only when `ENABLE_BATCH_BUCKET=true`) |
 | Artifact Registry / logging | `roles/artifactregistry.reader`, `roles/logging.logWriter`, etc. |
 | **Drive file upload** | **Not** an IAM role — share the Shared Drive folder with `ocrapi-sa@...` as **Content Manager** |
 | Drive API | Enable `drive.googleapis.com` on the project (`01-provision.sh` enables it) |
