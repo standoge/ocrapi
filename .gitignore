@@ -14,3 +14,6 @@ build/
 /gcp-credentials-development.json
 /ocrapi.wiki
 /deploy/gcp/ocrapi.env.internal.example
+/FIX-DATA-DISK.md
+/endpoints-doc-template.md
+/endpoints-doc.md
