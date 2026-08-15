@@ -38,6 +38,12 @@ echo "==> Data disk: ${DEV_LINK} -> ${DEV_PATH}"
 
 FSTYPE="$(blkid -o value -s TYPE "${DEV_PATH}" || true)"
 if [[ -z "${FSTYPE}" ]]; then
+  # blkid exits non-zero both for "no filesystem" and for real errors; a
+  # transient failure here must never wipe a formatted disk, so double-check.
+  if [[ -n "$(lsblk -no FSTYPE "${DEV_PATH}" | tr -d '[:space:]')" ]]; then
+    echo "ERROR: blkid saw no filesystem on ${DEV_PATH} but lsblk disagrees; refusing to mkfs." >&2
+    exit 1
+  fi
   echo "==> Formatting ${DEV_PATH} as ext4..."
   mkfs.ext4 -F -m 0 -E lazy_itable_init=0,lazy_journal_init=0,discard "${DEV_PATH}"
 else
@@ -47,12 +53,43 @@ fi
 mkdir -p "${MOUNT_POINT}"
 UUID="$(blkid -o value -s UUID "${DEV_PATH}")"
 FSTAB_LINE="UUID=${UUID} ${MOUNT_POINT} ext4 discard,defaults,nofail 0 2"
-if ! grep -q "UUID=${UUID}" /etc/fstab; then
+# Guard on the MOUNT POINT, not the UUID: if the disk was ever reformatted its
+# UUID changed, and guarding on the UUID would append a second ${MOUNT_POINT}
+# line while leaving the stale one — systemd's fstab generator only honors the
+# first, so the mount would fail at boot with "Dependency failed". Stale
+# entries are removed even when the correct line is already present, since it
+# may sit BELOW the stale one.
+FSTAB_CHANGED=0
+STALE="$(awk -v mp="${MOUNT_POINT}" -v u="UUID=${UUID}" \
+  '$1 !~ /^#/ && $2 == mp && $1 != u' /etc/fstab || true)"
+if [[ -n "${STALE}" ]]; then
+  echo "==> Removing stale ${MOUNT_POINT} entries from /etc/fstab:"
+  echo "${STALE}"
+  awk -v mp="${MOUNT_POINT}" -v u="UUID=${UUID}" \
+    '$1 ~ /^#/ || $2 != mp || $1 == u' /etc/fstab > /etc/fstab.new
+  cat /etc/fstab.new > /etc/fstab
+  rm -f /etc/fstab.new
+  FSTAB_CHANGED=1
+fi
+if ! grep -qE "^UUID=${UUID}[[:space:]]+${MOUNT_POINT}[[:space:]]" /etc/fstab; then
   echo "${FSTAB_LINE}" >> /etc/fstab
+  FSTAB_CHANGED=1
+fi
+if [[ "${FSTAB_CHANGED}" -eq 1 ]]; then
+  systemctl daemon-reload
   echo "==> /etc/fstab updated."
 fi
 
 if ! mountpoint -q "${MOUNT_POINT}"; then
+  # If the mount previously failed (e.g. stale fstab UUID), the app may have
+  # been writing into ${MOUNT_POINT} on the BOOT disk. Mounting now would
+  # shadow that data (live TLS cert + job dirs). Refuse and point at the guide.
+  if [[ -n "$(find "${MOUNT_POINT}" -mindepth 1 -maxdepth 1 ! -name 'lost+found' -print -quit 2>/dev/null)" ]]; then
+    echo "ERROR: ${MOUNT_POINT} contains data but is not a mount point." >&2
+    echo "Mounting now would shadow it. Migrate it to the data disk first:" >&2
+    echo "see FIX-DATA-DISK.md at the repo root." >&2
+    exit 1
+  fi
   mount "${MOUNT_POINT}"
 fi
 

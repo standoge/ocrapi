@@ -3,6 +3,10 @@ Description=ocrapi (FastAPI + Document AI batch + PyMuPDF)
 Documentation=https://github.com/your-org/ocrapi
 Wants=network-online.target docker.service
 After=network-online.target docker.service data.mount
+# Hard dependency, not just ordering: if the data disk fails to mount, refuse
+# to start instead of silently writing the TLS cert and job dirs to the boot
+# disk (where they would not survive a VM rebuild).
+RequiresMountsFor=/data
 
 [Service]
 # /etc/ocrapi.image is written by 04-run.sh and pins the exact image tag, e.g.
