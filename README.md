@@ -2,49 +2,49 @@
 
 REST API for OCR over PDFs using **GCP Document AI**. Async jobs produce a searchable PDF via **PyMuPDF** invisible text-layer injection; the sync endpoint returns the extracted text layer as plain text.
 
-## Features
-
-- `POST /v1/jobs` — submit a PDF for async OCR (recommended for large documents)
-- `GET /v1/jobs/{jobId}` — poll job status
-- `GET /v1/jobs/{jobId}/result` — download searchable PDF when ready
-- `POST /v1/jobs/{jobId}/drive` — upload a finished job's result to Google Drive
-- `POST /v1/ocr` — upload a PDF, receive its OCR text layer synchronously as `text/plain`
-- Design-first OpenAPI contract at `/openapi.yml`
-
 ## Documentation
 
-Technical details live in the [project wiki](../../wiki):
+This README covers what you need to **run** the project. Technical and architectural documentation lives in the [project wiki](../../wiki):
 
 - **[Architecture](../../wiki/Architecture)** — how the project works end to end
 - **[Infrastructure](../../wiki/Infrastructure)** — GCP services, their configuration, and a service diagram
 - **[OCR Plugin](../../wiki/OCR-Plugin)** — the `ocr_documentai_plugin` (Document AI + PyMuPDF)
 - **[Job Manager](../../wiki/Job-Manager)** — the async job queue and worker pool
-- **[Endpoints](../../wiki/Home)** — full HTTP endpoint reference
+- **[Configuration](../../wiki/Configuration)** — full environment-variable reference
+- **[Endpoints & usage](../../wiki/Home)** — full HTTP endpoint reference with curl examples
 
-## Prerequisites
+## Required knowledge
 
-1. **GCP**
-   - Enable Document AI API
-   - Create a **Document OCR** processor and note `processor_id` and `location`
-   - Create a service account with `roles/documentai.apiUser`
-   - Create a GCS bucket (required by config; used only if batch OCR is enabled)
+To run and operate this project you should be comfortable with:
 
-2. **Google Drive**
-   - Enable **Google Drive API** on the project
-   - Create or use a **Shared Drive** folder (not a personal My Drive folder)
-   - Share the folder with the service account email as **Content Manager**
-   - On GCE, ensure the VM OAuth access scopes include `https://www.googleapis.com/auth/drive` in addition to `cloud-platform` (see [`deploy/gcp/README.md`](deploy/gcp/README.md))
+- **Python 3.11+** and virtual environments (the app is FastAPI + uvicorn)
+- **Docker** basics (build, run, `--env-file`) for containerized runs
+- **GCP fundamentals**: projects, IAM service accounts, and enabling APIs — specifically **Document AI** (what a processor is) and **Cloud Storage**
+- **Google Drive Shared Drives** (only if you use the Drive upload feature): how folder sharing and folder IDs work
+- For production deploys: **GCE VMs**, **systemd** units, and `gcloud` CLI (see [`deploy/gcp/README.md`](deploy/gcp/README.md))
 
-3. **Runtime**
-   - Python 3.11+
-   - No system OCR or PDF rasterization tools required (PyMuPDF and Document AI handle the pipeline)
-   - Docker image is Python slim only (see `Dockerfile`)
+## Required resources
+
+1. **GCP project** with:
+   - Document AI API enabled, and a **Document OCR** processor (note its `processor_id` and `location`)
+   - A service account with `roles/documentai.apiUser` (JSON key for local dev; on GCE the VM's attached service account is used — no key file)
+   - A GCS bucket (required by config; used only if batch OCR is enabled)
+
+2. **Google Drive** (optional, for result delivery):
+   - Google Drive API enabled on the project
+   - A **Shared Drive** folder (not a personal My Drive folder), shared with the service account email as **Content Manager**
+   - On GCE, the VM's OAuth scopes must include `https://www.googleapis.com/auth/drive` in addition to `cloud-platform` (see [`deploy/gcp/README.md`](deploy/gcp/README.md))
+
+3. **Local machine**:
+   - Python 3.11+ (no system OCR or PDF tools needed — PyMuPDF and Document AI handle the pipeline)
+   - Docker (optional, for containerized runs)
 
 ## Setup
 
 ```bash
 cp .env.example .env
-# Edit .env with your values
+# Edit .env with your GCP project, processor and bucket values.
+# Full variable reference: wiki Configuration page.
 
 pip install -e ".[dev]"
 ```
@@ -55,7 +55,13 @@ pip install -e ".[dev]"
 uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
-Open Swagger UI at http://localhost:8000/docs
+Open Swagger UI at http://localhost:8000/docs, or smoke-test with:
+
+```bash
+curl http://localhost:8000/healthz
+```
+
+For endpoint usage (async jobs, sync OCR, Drive upload) see [Endpoints & usage](../../wiki/Home).
 
 ## Docker
 
@@ -66,91 +72,7 @@ docker run --env-file .env -p 8000:8000 ocrapi
 
 ## Deploy to GCP
 
-See [`deploy/gcp/README.md`](deploy/gcp/README.md) for provisioning a single GCE VM with Docker, a data disk for `JOBS_DIR`, Artifact Registry, and systemd units.
-
-## API usage
-
-### Async OCR (large documents)
-
-For PDFs with many pages (1000+), use the job API so the client does not hold a long HTTP connection:
-
-```bash
-# Submit job
-curl -X POST http://localhost:8000/v1/jobs \
-  -F "file=@large-document.pdf"
-
-# Poll status (replace JOB_ID)
-curl http://localhost:8000/v1/jobs/JOB_ID
-
-# Download result when status is "succeeded"
-curl -OJ http://localhost:8000/v1/jobs/JOB_ID/result
-```
-
-Optional: upload result to Google Drive on completion (use the full Shared Drive folder ID):
-
-```bash
-curl -X POST http://localhost:8000/v1/jobs \
-  -F "file=@large-document.pdf" \
-  -F "filename=searchable-document.pdf" \
-  -F "folder_id=YOUR_SHARED_DRIVE_FOLDER_ID"
-```
-
-Batch submit (multiple PDFs in parallel; each job uploads independently when OCR finishes):
-
-```bash
-API=http://YOUR_HOST:8000
-ls *.pdf | xargs -n1 -P4 -I{} curl -X POST "$API/v1/jobs" \
-  -F "file=@{}" \
-  -F "folder_id=YOUR_SHARED_DRIVE_FOLDER_ID"
-```
-
-Or upload after the job succeeds (omit `folderId` to use `DRIVE_SHARED_FOLDER_ID`):
-
-```bash
-curl -X POST http://localhost:8000/v1/jobs/JOB_ID/drive \
-  -H "Content-Type: application/json" \
-  -d '{"folderId": "YOUR_SHARED_DRIVE_FOLDER_ID", "filename": "searchable-document.pdf"}'
-
-curl -X POST http://localhost:8000/v1/jobs/JOB_ID/drive \
-  -H "Content-Type: application/json" \
-  -d '{}'
-```
-
-### Sync OCR (plain-text extraction)
-
-Upload a PDF and get its OCR text layer back as plain text in the same request. Large PDFs
-are split into chunks processed concurrently; the connection stays open until OCR completes:
-
-```bash
-curl -X POST http://localhost:8000/v1/ocr \
-  -F "file=@document.pdf" \
-  -o document.txt
-```
-
-## Configuration
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `GCP_PROJECT_ID` | — | GCP project containing the Document AI processor |
-| `GCP_LOCATION` | `us` | Document AI processor location |
-| `GCP_PROCESSOR_ID` | — | Document OCR processor ID |
-| `GOOGLE_APPLICATION_CREDENTIALS` | — | Path to service account JSON (optional on GCE; uses VM SA via ADC) |
-| `GCS_BUCKET` | — | GCS bucket for batch OCR scratch (unused by current async jobs) |
-| `BATCH_TIMEOUT_SECONDS` | `1800` | Timeout for batch OCR LRO polling |
-| `BATCH_POLL_INTERVAL_SECONDS` | `10` | Poll interval for batch OCR |
-| `DRIVE_SHARED_FOLDER_ID` | — | Optional default Shared Drive folder for `/v1/jobs` and `/v1/jobs/{jobId}/drive` when folder ID is omitted |
-| `MAX_UPLOAD_BYTES` | `629145600` (600 MB) | Maximum upload size for job and sync endpoints |
-| `MAX_PDF_PAGES` | `2000` | Maximum pages per PDF (sync and async) |
-| `ONLINE_CHUNK_PAGES` | `15` | Maximum pages per online OCR chunk |
-| `ONLINE_CHUNK_MAX_BYTES` | `18874368` (18 MB) | Maximum bytes per online OCR chunk |
-| `ONLINE_MAX_CONCURRENCY` | `8` | Concurrent online `processDocument` calls per PDF |
-| `PDF_SAVE_INCREMENTAL` | `true` | PyMuPDF incremental save when injecting text layer |
-| `PDF_USE_TEXTWRITER` | `true` | PyMuPDF TextWriter for faster token injection |
-| `JOBS_DIR` | `jobs` | Directory for job input/output files |
-| `OCR_WORKER_CONCURRENCY` | `4` | Number of PDFs processed in parallel |
-
-> For concurrency tuning, quota, disk retention, and how the settings interact, see the
-> [Job Manager](../../wiki/Job-Manager) and [Infrastructure](../../wiki/Infrastructure) wiki pages.
+See [`deploy/gcp/README.md`](deploy/gcp/README.md) for provisioning a single GCE VM with Docker, a data disk for `JOBS_DIR`, TLS, Artifact Registry, and systemd units. 
 
 ## Tests
 
