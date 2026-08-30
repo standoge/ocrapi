@@ -10,6 +10,7 @@ venv/
 dist/
 build/
 *.pdf
+/.cursor
 /gcp-credentials.json
 /gcp-credentials-development.json
 /ocrapi.wiki
